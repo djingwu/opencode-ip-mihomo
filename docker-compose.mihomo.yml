@@ -1,0 +1,147 @@
+# ============================================================
+#  OpenCode IP Mihomo — mihomo (Clash Meta) 版
+#  把原来的 Cloudflare WARP 出口替换为机场代理节点池，
+#  429 时通过 mihomo external-controller API 自动切换节点。
+#
+#  使用（镜像模式，默认）：
+#    docker compose -f docker-compose.mihomo.yml up -d
+#
+#  使用（本地源码构建，开发）：
+#    docker compose -f docker-compose.mihomo.yml -f docker-compose.build.yml up -d --build
+#
+#  可配置项（写进 .env 或环境变量）：
+#    PROXY_IMAGE / ROTATOR_IMAGE  —— 镜像地址（默认 proxy / rotator 独立仓库）
+#    BIND_IP                       —— 宿主机绑定地址（默认 docker0 网关，不暴露公网）
+#    GATEWAY_PORT                  —— 宿主机访问端口（默认 24513，容器内仍为 8000）
+#    MIHOMO_SECRET                 —— mihomo 控制密码
+#    MIHOMO_MAX_LATENCY            —— 节点延迟上限 ms（默认 300）
+#    WARP_ROTATION_INTERVAL        —— 定时轮换间隔 s（默认 300）
+# ============================================================
+services:
+  # 在 mihomo 读取配置前先迁移旧版 ROTATOR.proxies 节点快照。
+  # 该一次性服务成功退出后 mihomo 才启动，避免 provider 节点尚未注册时
+  # 因 "<node> not found" 陷入 crash-loop。
+  config-repair:
+    image: ${PROXY_IMAGE:-jiuwangka/opencode-ip-mihomo-proxy:latest}
+    container_name: opencode_config_repair
+    restart: "no"
+    volumes:
+      - ./mihomo:/data/mihomo
+    environment:
+      - MIHOMO_CONFIG_DIR=/data/mihomo
+    command:
+      - python
+      - -c
+      - |
+        import panel_manager as panel
+        result = panel.normalize_mihomo_config()
+        print(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+  proxy-server:
+    # 生产：直接拉 Docker Hub 镜像（可通过 PROXY_IMAGE 覆盖）
+    image: ${PROXY_IMAGE:-jiuwangka/opencode-ip-mihomo-proxy:latest}
+    # 开发：本地源码构建（取消注释 image 行并启用下面 build 段）
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.proxy.mihomo
+    container_name: opencode_proxy_server
+    ports:
+      # 仅绑定 docker0 网关（BIND_IP），不暴露公网。
+      # 访问方式：sub2api 容器 / SSH 隧道通过 BIND_IP:GATEWAY_PORT 访问
+      - "${BIND_IP:-172.17.0.1}:${GATEWAY_PORT:-24513}:8000"
+    depends_on:
+      - mihomo
+      - rotator
+    volumes:
+      - ./data:/app/data
+      # 共享 mihomo 配置目录：面板的订阅/节点/组管理直接改写 config.yaml
+      # 后调 mihomo API 热重载，无需重启容器
+      - ./mihomo:/data/mihomo
+    restart: unless-stopped
+    environment:
+      - OPENCODE_ZEN_PORT=8000
+      - OPENCODE_ZEN_HOST=0.0.0.0
+      - OPENCODE_ZEN_TARGET_BASE=https://opencode.ai/zen/v1
+      # 出站统一走 mihomo 混合端口（节点池）
+      - CUSTOM_OUTBOUND_PROXY=http://mihomo:7890
+      # 429/空流等场景由 rotator 负责换节点
+      - WARP_ROTATOR_URL=http://rotator:8001
+      # 面板管理：访问 mihomo API 做热重载 + 共享配置目录路径
+      - MIHOMO_API_URL=http://mihomo:9090
+      - MIHOMO_SECRET=${MIHOMO_SECRET:-}
+      - MIHOMO_CONFIG_DIR=/data/mihomo
+      - MIHOMO_CONTROLLER_CONFIG_PATH=/root/.config/mihomo/config.yaml
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://127.0.0.1:24513,http://localhost:24513}
+      # OpenCode Zen 免费层：单并发、匿名 IP 约 10 RPM；429 先在原出口等待，连续两次才换出口
+      - MAX_RETRIES_ON_429=${MAX_RETRIES_ON_429:-4}
+      - UPSTREAM_RPM=${UPSTREAM_RPM:-10}
+      - MAX_UPSTREAM_CONCURRENCY=${MAX_UPSTREAM_CONCURRENCY:-1}
+      - RATE_LIMIT_ROTATION_THRESHOLD=${RATE_LIMIT_ROTATION_THRESHOLD:-2}
+      - MAX_RATE_LIMIT_WAIT=${MAX_RATE_LIMIT_WAIT:-8}
+      - NETWORK_FAILURE_ROTATION_THRESHOLD=${NETWORK_FAILURE_ROTATION_THRESHOLD:-2}
+      # 面板节点测速：由 mihomo 对每个节点独立探测，不复用 ROTATOR 当前出口
+      - PANEL_LATENCY_TIMEOUT=${PANEL_LATENCY_TIMEOUT:-15000}
+      - PANEL_LATENCY_ATTEMPTS=${PANEL_LATENCY_ATTEMPTS:-2}
+      - PANEL_LATENCY_RETRY_DELAY=${PANEL_LATENCY_RETRY_DELAY:-0.25}
+      - PANEL_LATENCY_WORKERS=${PANEL_LATENCY_WORKERS:-8}
+      - PANEL_LATENCY_BATCH_SIZE=${PANEL_LATENCY_BATCH_SIZE:-40}
+      - PANEL_LATENCY_BATCH_PAUSE=${PANEL_LATENCY_BATCH_PAUSE:-0.15}
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  rotator:
+    # 生产：直接拉 Docker Hub 镜像（可通过 ROTATOR_IMAGE 覆盖）
+    image: ${ROTATOR_IMAGE:-jiuwangka/opencode-ip-mihomo-rotator:latest}
+    # 开发：本地源码构建（取消注释 image 行并启用下面 build 段）
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.rotator
+    container_name: opencode_rotator
+    depends_on:
+      - mihomo
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    environment:
+      # mihomo 控制 API（容器内网，无需暴露到宿主机）
+      - MIHOMO_API_URL=http://mihomo:9090
+      - MIHOMO_GROUP=ROTATOR
+      - MIHOMO_SECRET=${MIHOMO_SECRET:-}
+      # 走 mihomo 出口做 IP 验证/健康检查（验证的是节点出口，而非 VPS 本机 IP）
+      - MIHOMO_OUTBOUND_PROXY=http://mihomo:7890
+      # 节点延迟上限(ms)：超过则跳过该节点（0=不限制；建议200-300）
+      - MIHOMO_MAX_LATENCY=${MIHOMO_MAX_LATENCY:-300}
+      # 健康检查探测中性连通性地址（勿用 opencode.ai 首页，其对机房 IP 有风控）
+      - WARP_CHECK_ENDPOINT=${WARP_CHECK_ENDPOINT:-https://www.gstatic.com/generate_204}
+      - WARP_CHECK_INTERVAL=${WARP_CHECK_INTERVAL:-60}
+      - WARP_ROTATION_INTERVAL=${WARP_ROTATION_INTERVAL:-300}
+      - METRICS_DB_PATH=/app/data/metrics.db
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: opencode_mihomo
+    depends_on:
+      config-repair:
+        condition: service_completed_successfully
+    volumes:
+      - ./mihomo/config.yaml:/root/.config/mihomo/config.yaml:ro
+      - ./mihomo/providers:/root/.config/mihomo/providers
+    restart: unless-stopped
+    # 混合端口 7890 与控制器 9090 仅容器内网使用，不映射到宿主机
+    # 如需从宿主机调试可放开下面两行：
+    # ports:
+    #   - "7890:7890"
+    #   - "9090:9090"

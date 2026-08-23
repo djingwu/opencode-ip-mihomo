@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="h-full bg-slate-50/50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenCode IP 轮换控制台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="h-full text-slate-900 font-sans antialiased selection:bg-slate-900 selection:text-white">
+    <header class="bg-white/80 backdrop-blur-md border-b border-slate-200/80 sticky top-0 z-50">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-7 h-7 bg-slate-900 text-white rounded-md flex items-center justify-center font-semibold text-xs tracking-wider">OP</div>
+                <div class="flex items-center space-x-2">
+                    <span class="font-semibold text-sm tracking-tight text-slate-900">opencode-ip-mihomo</span>
+                    <span class="text-[10px] bg-slate-100 text-slate-600 font-mono font-medium px-2 py-0.5 rounded border border-slate-200">V1.0</span>
+                </div>
+            </div>
+            <div class="flex items-center space-x-3">
+                <div class="flex items-center space-x-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200/60 text-xs px-2.5 py-1 rounded-full font-medium">
+                    <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
+                    <span class="text-[11px]">运行中</span>
+                </div>
+                <button id="rotate-btn" onclick="rotateNow()" class="inline-flex items-center justify-center bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95">轮换 IP</button>
+            </div>
+        </div>
+        <nav class="max-w-6xl mx-auto px-4 sm:px-6 flex items-center space-x-1 -mb-px">
+            <button onclick="switchTab('overview')" data-tab="overview" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">概览</button>
+            <button onclick="switchTab('subs')" data-tab="subs" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">订阅管理</button>
+            <button onclick="switchTab('nodes')" data-tab="nodes" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">节点管理</button>
+            <button onclick="switchTab('groups')" data-tab="groups" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">节点组</button>
+            <button onclick="switchTab('test')" data-tab="test" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">模型测试</button>
+            <button onclick="switchTab('proxy')" data-tab="proxy" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">代理池</button>
+        </nav>
+    </header>
+
+    <!-- ============ Tab: 概览 ============ -->
+    <section id="tab-overview" class="tab-panel max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            <div class="bg-white border border-slate-200/80 rounded-xl p-4 shadow-sm space-y-1">
+                <p class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">当前出口 IP</p>
+                <div class="flex items-center space-x-2">
+                    <span id="flag" class="text-base">&#x1F310;</span>
+                    <span id="ip" class="text-base font-bold font-mono text-slate-900 tracking-tight">加载中...</span>
+                </div>
+                <p id="location" class="text-xs text-slate-500 font-medium truncate pt-0.5">正在检测位置...</p>
+            </div>
+            <div class="bg-white border border-slate-200/80 rounded-xl p-4 shadow-sm space-y-1">
+                <p class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">总请求数</p>
+                <p id="requests" class="text-xl font-bold font-mono text-slate-900">0</p>
+                <p class="text-xs text-slate-400">已代理的 AI 补全请求</p>
+            </div>
+            <div class="bg-white border border-slate-200/80 rounded-xl p-4 shadow-sm space-y-1">
+                <p class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">轮换次数 / 429 限流</p>
+                <div class="flex items-baseline space-x-1.5 font-mono">
+                    <span id="rotations" class="text-xl font-bold text-slate-900">0</span>
+                    <span class="text-slate-300 text-sm">/</span>
+                    <span id="ratelimits" class="text-base font-semibold text-amber-600">0</span>
+                </div>
+                <p class="text-xs text-slate-400">节点轮换 / 已绕过</p>
+            </div>
+            <div class="bg-emerald-50/40 border border-emerald-200/60 rounded-xl p-4 shadow-sm space-y-1">
+                <p class="text-[11px] font-medium text-emerald-700 uppercase tracking-wider">预估节省金额</p>
+                <p id="total-saved" class="text-xl font-bold font-mono text-emerald-600">$0.0000</p>
+                <p class="text-xs text-emerald-600/80">等效 OpenCode 成本</p>
+            </div>
+        </div>
+
+        <!-- 配额耗尽提示条（FreeUsageLimit 等：换 IP 无法恢复） -->
+        <div id="quota-banner" class="hidden bg-rose-50 border border-rose-200 rounded-xl p-3.5 flex items-start gap-3 shadow-sm">
+            <div class="w-8 h-8 bg-rose-100 text-rose-600 rounded-md flex items-center justify-center shrink-0 text-sm">⚠️</div>
+            <div class="flex-1">
+                <p class="text-xs font-semibold text-rose-700">检测到配额级限流（换 IP 无法恢复）</p>
+                <p class="text-[11px] text-rose-500 mt-0.5">已累计触发 <span id="quota-count" class="font-bold">0</span> 次。这通常意味着当前模型的免费额度已耗尽，换节点不会解决——建议换个模型或等待额度重置。</p>
+            </div>
+            <button onclick="dismissQuotaBanner()" class="text-rose-400 hover:text-rose-600 text-xs px-1.5">&times;</button>
+        </div>
+
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <div><h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">模型用量明细</h2></div>
+                <span id="model-count-badge" class="bg-white text-slate-600 text-[11px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200">0 个活跃</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr><th class="px-5 py-2.5">模型</th><th class="px-5 py-2.5">请求数</th><th class="px-5 py-2.5">输入 Token</th><th class="px-5 py-2.5">输出 Token</th><th class="px-5 py-2.5">总 Token</th><th class="px-5 py-2.5 text-right">节省 USD</th></tr>
+                    </thead>
+                    <tbody id="usage-table-body" class="divide-y divide-slate-100 font-mono text-slate-700">
+                        <tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录，发送提示词后即可实时统计。</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
+                <span id="model-page-info">第 1 / 1 页</span>
+                <div class="flex items-center space-x-1">
+                    <button id="model-prev-btn" onclick="changeModelPage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">上一页</button>
+                    <button id="model-next-btn" onclick="changeModelPage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">下一页</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50"><h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">IP 轮换记录</h2></div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr><th class="px-5 py-2.5">时间</th><th class="px-5 py-2.5">分配的 IP</th><th class="px-5 py-2.5">国家/地区</th><th class="px-5 py-2.5 text-right">原因</th></tr>
+                    </thead>
+                    <tbody id="ip-history-body" class="divide-y divide-slate-100 font-mono text-slate-700">
+                        <tr><td colspan="4" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无轮换记录。</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
+                <span id="ip-page-info">第 1 / 1 页</span>
+                <div class="flex items-center space-x-1">
+                    <button id="ip-prev-btn" onclick="changeIpPage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">上一页</button>
+                    <button id="ip-next-btn" onclick="changeIpPage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">下一页</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50"><h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">节点质量指标</h2></div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr><th class="px-5 py-2.5">指标</th><th class="px-5 py-2.5 text-right">数值</th></tr>
+                    </thead>
+                    <tbody id="warp-quality-body" class="divide-y divide-slate-100 font-mono text-slate-700">
+                        <tr><td colspan="2" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无轮换数据。</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ Tab: 订阅管理 ============ -->
+    <section id="tab-subs" class="tab-panel hidden max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">订阅管理</h2>
+                <button onclick="refreshSubscriptions()" class="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95">刷新全部订阅</button>
+            </div>
+            <div class="p-5 space-y-3">
+                <div class="flex gap-2">
+                    <input id="new-sub-url" type="text" placeholder="粘贴机场订阅链接（http/https）..." class="flex-1 text-xs border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+                    <button onclick="addSubscription()" class="inline-flex items-center bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-9 px-4 rounded-md transition-all shadow-sm active:scale-95">添加订阅</button>
+                </div>
+                <p id="sub-msg" class="text-xs text-slate-400"></p>
+
+                <!-- 免费节点模块（无订阅用户） -->
+                <div class="border border-slate-200 rounded-xl p-4 bg-slate-50/40 space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs font-semibold text-slate-900">免费节点</span>
+                            <span id="free-node-badge" class="bg-white text-slate-500 text-[10px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200">未启用</span>
+                        </div>
+                        <button onclick="fetchFreeNodes()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-slate-50 active:scale-95">一键抓取并启用</button>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <label class="text-[11px] text-slate-500">节点来源
+                            <select id="free-region-mode" onchange="toggleFreeRegionSelector()" class="mt-1 w-full text-xs border border-slate-200 rounded-md px-2.5 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-slate-300">
+                                <option value="auto">全球轻量优选</option>
+                                <option value="manual">按国家/地区选择</option>
+                            </select>
+                        </label>
+                        <label class="text-[11px] text-slate-500">国家/地区
+                            <select id="free-region-select" disabled class="mt-1 w-full text-xs border border-slate-200 rounded-md px-2.5 py-2 bg-white disabled:bg-slate-100 disabled:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-300">
+                                <option value="all">全部国家/地区</option>
+                                <option value="at">🇦🇹 AT Austria</option>
+                                <option value="au">🇦🇺 AU Australia</option>
+                                <option value="bg">🇧🇬 BG Bulgaria</option>
+                                <option value="br">🇧🇷 BR Brazil</option>
+                                <option value="ca">🇨🇦 CA Canada</option>
+                                <option value="ch">🇨🇭 CH Switzerland</option>
+                                <option value="cz">🇨🇿 CZ Czech Republic</option>
+                                <option value="de">🇩🇪 DE Germany</option>
+                                <option value="es">🇪🇸 ES Spain</option>
+                                <option value="fi">🇫🇮 FI Finland</option>
+                                <option value="fr">🇫🇷 FR France</option>
+                                <option value="gb">🇬🇧 GB United Kingdom</option>
+                                <option value="hk">🇭🇰 HK Hong Kong</option>
+                                <option value="hu">🇭🇺 HU Hungary</option>
+                                <option value="id">🇮🇩 ID Indonesia</option>
+                                <option value="il">🇮🇱 IL Israel</option>
+                                <option value="in">🇮🇳 IN India</option>
+                                <option value="ir">🇮🇷 IR Iran</option>
+                                <option value="it">🇮🇹 IT Italy</option>
+                                <option value="jp">🇯🇵 JP Japan</option>
+                                <option value="kr">🇰🇷 KR South Korea</option>
+                                <option value="kz">🇰🇿 KZ Kazakhstan</option>
+                                <option value="lt">🇱🇹 LT Lithuania</option>
+                                <option value="md">🇲🇩 MD Moldova</option>
+                                <option value="nl">🇳🇱 NL Netherlands</option>
+                                <option value="pl">🇵🇱 PL Poland</option>
+                                <option value="pt">🇵🇹 PT Portugal</option>
+                                <option value="rs">🇷🇸 RS Serbia</option>
+                                <option value="ru">🇷🇺 RU Russia</option>
+                                <option value="se">🇸🇪 SE Sweden</option>
+                                <option value="sg">🇸🇬 SG Singapore</option>
+                                <option value="si">🇸🇮 SI Slovenia</option>
+                                <option value="tr">🇹🇷 TR Turkey</option>
+                                <option value="ua">🇺🇦 UA Ukraine</option>
+                                <option value="us">🇺🇸 US United States</option>
+                                <option value="vn">🇻🇳 VN Vietnam</option>
+                            </select>
+                        </label>
+                        <label class="text-[11px] text-slate-500">最多实例数
+                            <input id="free-max-nodes" type="number" min="1" max="2000" value="50" class="mt-1 w-full text-xs border border-slate-200 rounded-md px-2.5 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-slate-300" />
+                        </label>
+                    </div>
+                    <p class="text-[11px] text-slate-500 leading-relaxed">免费节点数量限制为1000个，默认为50个。节点越多，mihomo 健康检查耗时越长，且系统不保证稳定性。</p>
+                    <p class="text-[11px] text-amber-600">免费公共上游实例不保证可用性！</p>
+                    <p id="free-node-msg" class="text-xs text-slate-400"></p>
+                </div>
+
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr><th class="px-4 py-2.5">名称</th><th class="px-4 py-2.5">节点数</th><th class="px-4 py-2.5">刷新间隔</th><th class="px-4 py-2.5">订阅链接</th><th class="px-4 py-2.5 text-right">操作</th></tr>
+                    </thead>
+                    <tbody id="sub-table-body" class="divide-y divide-slate-100 text-slate-700">
+                        <tr><td colspan="6" class="px-4 py-6 text-center text-slate-400 italic font-sans text-xs">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ Tab: 节点管理 ============ -->
+    <section id="tab-nodes" class="tab-panel hidden max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 flex flex-wrap gap-2 items-center justify-between bg-slate-50/50">
+                <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">节点管理<span id="node-count-badge" class="ml-2 bg-white text-slate-600 text-[11px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200">0</span></h2>
+                <div class="flex items-center gap-2">
+                    <button onclick="selectAllNodes()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-slate-50 active:scale-95">全选</button>
+                    <button onclick="clearAllNodes()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-slate-50 active:scale-95">清除全选</button>
+                    <button onclick="deleteSelectedNodes()" class="inline-flex items-center bg-white border border-rose-200 text-rose-600 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-rose-50 active:scale-95">删除选中节点</button>
+                    <button onclick="refreshNodeList()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-slate-50 active:scale-95">刷新节点列表</button>
+                    <button id="clear-active-group-btn" onclick="clearActiveGroup()" class="hidden inline-flex items-center bg-white border border-violet-200 text-violet-600 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-violet-50 active:scale-95">退出应用组</button>
+                    <button onclick="testAllDelay()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3 rounded-md transition-all hover:bg-slate-50 active:scale-95">批量测延迟</button>
+                    <button id="cleanup-failed-btn" onclick="cleanupFailedNodes()" class="hidden inline-flex items-center bg-rose-600 hover:bg-rose-500 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95">一键清理失效实例</button>
+                    <button onclick="saveNodeSelection()" class="inline-flex items-center bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95">保存选择</button>
+                </div>
+            </div>
+            <div id="node-health-msg" class="p-3 bg-amber-50/60 border-b border-amber-100 text-[11px] text-amber-700">勾选要参与轮换的节点（默认全选）。保存后自动热重载，无需重启。</div>
+            <div class="px-3 py-2 bg-blue-50/60 border-b border-blue-100 text-[11px] text-blue-700">提示：不建议添加大量节点，可能存在延迟，以实际可用节点为准。测速、刷新、保存或清理完成后，状态可能存在短暂延迟，请耐心等候后再刷新查看。</div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider sticky top-0">
+                        <tr><th class="px-4 py-2.5 w-10">启用</th><th class="px-4 py-2.5">节点名</th><th class="px-4 py-2.5">订阅</th><th class="px-4 py-2.5">类型</th><th class="px-4 py-2.5">状态</th><th class="px-4 py-2.5 text-right">延迟 (ms)</th></tr>
+                    </thead>
+                    <tbody id="node-table-body" class="divide-y divide-slate-100 text-slate-700">
+                        <tr><td colspan="5" class="px-4 py-6 text-center text-slate-400 italic font-sans text-xs">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
+                <span id="node-page-info">第 1 / 1 页</span>
+                <div class="flex items-center space-x-1">
+                    <button id="node-prev-btn" onclick="changeNodePage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">上一页</button>
+                    <button id="node-next-btn" onclick="changeNodePage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">下一页</button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ Tab: 节点组 ============ -->
+    <section id="tab-groups" class="tab-panel hidden max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+                <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50">
+                    <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">创建节点组</h2>
+                </div>
+                <div class="p-5 space-y-3">
+                    <p class="text-[11px] text-slate-500">组 = 你在“节点管理”界面勾选后保存的节点快照。应用组后，ROTATOR 只使用该组节点；删除节点管理中的节点不会删除组内快照。</p>
+                    <input id="new-group-name" type="text" placeholder="组名，如：低延迟组" class="w-full text-xs border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+                    <div class="flex items-center justify-between text-[11px] text-slate-500">
+                        <span>已选节点：<span id="group-selected-count">0</span> 个（从节点管理界面勾选）</span>
+                        <span id="group-msg" class="text-amber-600"></span>
+                    </div>
+                    <button onclick="saveCurrentGroup()" class="w-full inline-flex items-center justify-center bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-9 rounded-md transition-all shadow-sm active:scale-95">创建组</button>
+                    <div class="border-t border-slate-100 pt-4 mt-4 space-y-2">
+                        <div class="flex items-start justify-between gap-3">
+                            <div>
+                                <h3 class="text-xs font-semibold text-slate-900">一键提取有效组</h3>
+                                <p class="mt-1 text-[11px] leading-5 text-slate-500">自动测量当前节点列表，将本次延迟探测成功的节点保存为新的“可用节点组”。已被 mihomo 确认为正常的节点会复用结果，其余节点按小批次探测。</p>
+                            </div>
+                            <button id="extract-healthy-group-btn" onclick="extractHealthyGroup(this)" class="shrink-0 inline-flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95 disabled:opacity-50 disabled:cursor-wait">一键提取</button>
+                        </div>
+                        <p id="extract-group-msg" class="text-[11px] text-slate-400">测速期间请保持页面打开；节点较多时会分批排队，节点数量过多不保证提取准确，请以实际可用节点为准！</p>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+                <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50">
+                    <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">我的节点组</h2>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-xs">
+                        <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                            <tr><th class="px-5 py-2.5">组名</th><th class="px-5 py-2.5">节点数</th><th class="px-5 py-2.5 text-right">操作</th></tr>
+                        </thead>
+                        <tbody id="group-table-body" class="divide-y divide-slate-100 text-slate-700">
+                            <tr><td colspan="3" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无节点组。</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ Tab: 模型测试 ============ -->
+    <section id="tab-test" class="tab-panel hidden max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+                <div class="px-5 py-3.5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                    <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">可用模型</h2>
+                    <button onclick="fetchModels()" class="inline-flex items-center bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95">拉取模型</button>
+                </div>
+                <div class="p-5">
+                    <div id="model-list" class="space-y-2 max-h-[300px] overflow-y-auto">
+                        <p class="text-xs text-slate-400">点击"拉取模型"查看可用免费模型。</p>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+                <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50">
+                    <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">连通性测试</h2>
+                </div>
+                <div class="p-5 space-y-3">
+                    <select id="test-model-select" class="w-full text-xs border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300 bg-white">
+                        <option value="">先拉取模型再选择</option>
+                    </select>
+                    <div class="flex gap-2">
+                        <button onclick="testModelConnectivity()" class="inline-flex items-center bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium h-9 px-4 rounded-md transition-all shadow-sm active:scale-95">发送 HI! 测试</button>
+                        <button onclick="testSelectedNode()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-9 px-4 rounded-md transition-all hover:bg-slate-50 active:scale-95">测当前出口延迟</button>
+                    </div>
+                    <pre id="test-result" class="text-[11px] bg-slate-50 border border-slate-200 rounded-md p-3 h-40 overflow-auto whitespace-pre-wrap text-slate-700">测试结果将显示在这里。</pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ Tab: 代理池 ============ -->
+    <section id="tab-proxy" class="tab-panel hidden max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="flex items-start justify-between">
+            <div>
+                <p class="text-sm font-semibold text-slate-900">代理池</p>
+                <p class="text-xs text-slate-400 mt-0.5">配置模型请求的备用出口，支持 http / https / socks5，故障自动切换</p>
+                <p id="proxy-route-msg" class="text-[11px] text-slate-500 mt-1">正在读取当前模型出口...</p>
+            </div>
+            <button onclick="checkAllProxies()" class="inline-flex items-center gap-1.5 bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3.5 rounded-md transition-all hover:bg-slate-50 active:scale-95">全部健康检查</button>
+        </div>
+
+        <!-- 卡片 A：添加代理 -->
+        <div class="bg-white border border-slate-200/80 rounded-xl p-5 shadow-sm space-y-3">
+            <h3 class="text-sm font-semibold text-slate-900">添加代理</h3>
+            <label class="text-xs text-slate-600">代理地址（一行一个，支持批量粘贴）</label>
+            <textarea id="proxy-input" rows="5" placeholder="http://user:pass@host:port&#10;socks5://127.0.0.1:1080&#10;https://proxy.example.com:443" class="w-full text-xs font-mono border border-slate-200 rounded-md px-3 py-2.5 resize-y focus:outline-none focus:ring-2 focus:ring-slate-300"></textarea>
+            <div class="flex items-center gap-2">
+                <button onclick="addProxies()" class="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-9 px-4 rounded-md transition-all shadow-sm active:scale-95">+ 添加</button>
+                <button onclick="testInputProxies()" class="inline-flex items-center bg-white border border-slate-200 text-slate-700 text-xs font-medium h-9 px-4 rounded-md transition-all hover:bg-slate-50 active:scale-95">测试连通性</button>
+            </div>
+            <p class="text-[11px] text-slate-400">支持格式：<code class="bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 text-[10px] text-slate-600">http://</code> <code class="bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 text-[10px] text-slate-600">https://</code> <code class="bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 text-[10px] text-slate-600">socks5://</code>，可带用户名密码。输入 <code class="bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 text-[10px] text-slate-600">socks5://</code> 后会自动使用远程 DNS。</p>
+            <p id="proxy-msg" class="text-xs text-slate-400"></p>
+            <div class="rounded-md border border-blue-100 bg-blue-50/70 px-3 py-2 text-[11px] leading-5 text-blue-700">
+                <strong>使用说明：</strong>代理池优先于 mihomo ROTATOR。模型请求会优先使用可用代理；失败代理会进入冷却并自动跳过；当代理池全部不可用时自动回退到 mihomo。点击顶部“轮换 IP”会先轮换代理池节点，代理池轮换完后再切换 ROTATOR；没有机场订阅时也可以只使用 SOCKS5 代理池。
+            </div>
+
+        </div>
+
+        <!-- 卡片 B：代理列表 -->
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+                <h3 class="text-sm font-semibold text-slate-900">代理列表</h3>
+                <span id="proxy-count-badge" class="bg-white text-slate-600 text-[11px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200">0 个</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr><th class="px-5 py-2.5">地址</th><th class="px-5 py-2.5">状态</th><th class="px-5 py-2.5 text-right">耗时</th><th class="px-5 py-2.5 text-right">失败次数</th><th class="px-5 py-2.5">冷却至</th><th class="px-5 py-2.5 text-right">操作</th></tr>
+                    </thead>
+                    <tbody id="proxy-table-body" class="divide-y divide-slate-100 text-slate-700">
+                        <tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无代理，请在上方添加。</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <script>
+        const PAGE_SIZE = 10;
+        let currentModelPage = 1;
+        let currentIpPage = 1;
+        let currentNodePage = 1;
+        let cachedModelKeys = [];
+        let cachedUsageData = {};
+        let cachedIpHistory = [];
+        let cachedNodes = [];
+        let nodeEnabledSet = new Set();
+        let nodeSelectionSet = new Set();
+        let nodeSelectionInitialized = false;
+        let currentNodePageData = [];
+        window.nodeProbeCompleted = false;
+        let currentTab = 'overview';
+        let cachedModels = [];
+
+        // ---------- Tab 切换 ----------
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab-panel').forEach(el => el.classList.add('hidden'));
+            document.getElementById('tab-' + tab).classList.remove('hidden');
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                const active = btn.dataset.tab === tab;
+                btn.classList.toggle('border-slate-900', active);
+                btn.classList.toggle('text-slate-900', active);
+                btn.classList.toggle('text-slate-500', !active);
+            });
+            if (tab === 'subs') loadSubscriptions();
+            if (tab === 'nodes') loadNodes();
+            if (tab === 'groups') loadGroups();
+            if (tab === 'proxy') loadProxies();
+        }
+
+        // ---------- 概览 ----------
+        function renderModelTable() {
+            const tableBody = document.getElementById('usage-table-body');
+            const totalPages = Math.max(1, Math.ceil(cachedModelKeys.length / PAGE_SIZE));
+            if (currentModelPage > totalPages) currentModelPage = totalPages;
+            const start = (currentModelPage - 1) * PAGE_SIZE;
+            const pageKeys = cachedModelKeys.slice(start, start + PAGE_SIZE);
+            if (pageKeys.length > 0) {
+                tableBody.innerHTML = pageKeys.map(model => {
+                    const item = cachedUsageData[model];
+                    const cost = item.estimated_cost_usd || 0;
+                    return `<tr class="hover:bg-slate-50/60 transition-colors"><td class="px-5 py-2.5 font-sans font-medium text-slate-900">${model}</td><td class="px-5 py-2.5">${item.requests}</td><td class="px-5 py-2.5 text-slate-400">${item.prompt_tokens.toLocaleString()}</td><td class="px-5 py-2.5 text-slate-400">${item.completion_tokens.toLocaleString()}</td><td class="px-5 py-2.5 font-bold text-slate-900">${item.total_tokens.toLocaleString()}</td><td class="px-5 py-2.5 text-right font-bold text-emerald-600">$${cost.toFixed(4)}</td></tr>`;
+                }).join('');
+            } else {
+                tableBody.innerHTML = '<tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录，发送提示词后即可实时统计。</td></tr>';
+            }
+            document.getElementById('model-page-info').innerText = `第 ${currentModelPage} / ${totalPages} 页`;
+            document.getElementById('model-prev-btn').disabled = (currentModelPage <= 1);
+            document.getElementById('model-next-btn').disabled = (currentModelPage >= totalPages);
+        }
+
+        function renderIpTable() {
+            const ipHistoryBody = document.getElementById('ip-history-body');
+            const reversedHistory = cachedIpHistory.slice(-25).reverse();
+            const totalPages = Math.max(1, Math.ceil(reversedHistory.length / PAGE_SIZE));
+            if (currentIpPage > totalPages) currentIpPage = totalPages;
+            const start = (currentIpPage - 1) * PAGE_SIZE;
+            const pageItems = reversedHistory.slice(start, start + PAGE_SIZE);
+            if (pageItems.length > 0) {
+                ipHistoryBody.innerHTML = pageItems.map(h => `<tr class="hover:bg-slate-50/60 transition-colors"><td class="px-5 py-2.5 text-slate-400">${h.timestamp}</td><td class="px-5 py-2.5 font-bold text-slate-900">${h.ip}</td><td class="px-5 py-2.5 font-sans">${h.flag} ${h.country}</td><td class="px-5 py-2.5 text-right text-slate-400 font-sans">${h.reason}</td></tr>`).join('');
+            } else {
+                ipHistoryBody.innerHTML = '<tr><td colspan="4" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无轮换记录。</td></tr>';
+            }
+            document.getElementById('ip-page-info').innerText = `第 ${currentIpPage} / ${totalPages} 页`;
+            document.getElementById('ip-prev-btn').disabled = (currentIpPage <= 1);
+            document.getElementById('ip-next-btn').disabled = (currentIpPage >= totalPages);
+        }
+
+        function changeModelPage(delta) { currentModelPage += delta; renderModelTable(); }
+        function changeIpPage(delta) { currentIpPage += delta; renderIpTable(); }
+
+        function renderWarpQuality(data) {
+            const body = document.getElementById('warp-quality-body');
+            if (data && data.warp_quality) {
+                const wq = data.warp_quality;
+                body.innerHTML = `
+                    <tr><td class="px-5 py-2.5 font-sans">总尝试次数</td><td class="px-5 py-2.5 text-right">${wq.total_attempts}</td></tr>
+                    <tr><td class="px-5 py-2.5 font-sans">成功轮换</td><td class="px-5 py-2.5 text-right text-emerald-600">${wq.successful_rotations}</td></tr>
+                    <tr><td class="px-5 py-2.5 font-sans">失败轮换</td><td class="px-5 py-2.5 text-right text-rose-600">${wq.failed_rotations}</td></tr>
+                    <tr><td class="px-5 py-2.5 font-sans">平均延迟 (ms)</td><td class="px-5 py-2.5 text-right">${wq.avg_latency_ms.toFixed(1)}</td></tr>
+                `;
+            }
+        }
+
+        async function fetchMetrics() {
+            try {
+                const res = await fetch('/metrics');
+                const data = await res.json();
+                document.getElementById('ip').innerText = data.verified_public_ip || '未连接';
+                if (data.location) {
+                    document.getElementById('location').innerText = (data.location.country || '') + (data.location.city ? ' (' + data.location.city + ')' : '');
+                    if (data.location.flag) document.getElementById('flag').innerText = data.location.flag;
+                }
+                cachedIpHistory = data.ip_history || [];
+                renderIpTable();
+                document.getElementById('rotations').innerText = data.total_rotations;
+                document.getElementById('requests').innerText = data.metrics.total_requests;
+                document.getElementById('ratelimits').innerText = data.metrics.rate_limited_requests;
+                // 配额级限流提示（换 IP 无法恢复）
+                const quotaCount = data.metrics.quota_exhausted_requests || 0;
+                document.getElementById('quota-count').innerText = quotaCount;
+                const quotaBanner = document.getElementById('quota-banner');
+                if (quotaCount > 0 && !sessionStorage.getItem('quota-banner-dismissed')) {
+                    quotaBanner.classList.remove('hidden');
+                } else {
+                    quotaBanner.classList.add('hidden');
+                }
+                const models = data.discovered_models || [];
+                document.getElementById('model-count-badge').innerText = models.length + ' 个模型';
+                cachedUsageData = data.model_usage || {};
+                cachedModelKeys = Object.keys(cachedUsageData);
+                let grandTotalUsd = 0;
+                cachedModelKeys.forEach(m => { grandTotalUsd += (cachedUsageData[m].estimated_cost_usd || 0); });
+                document.getElementById('total-saved').innerText = '$' + grandTotalUsd.toFixed(4);
+                renderModelTable();
+                renderWarpQuality(data);
+            } catch (e) { /* dashboard will retry */ }
+        }
+
+        function dismissQuotaBanner() {
+            document.getElementById('quota-banner').classList.add('hidden');
+            sessionStorage.setItem('quota-banner-dismissed', '1');
+        }
+
+        async function rotateNow() {
+            const btn = document.getElementById('rotate-btn');
+            const originalText = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="animate-spin -ml-1 mr-1.5 h-3.5 w-3.5 text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> 轮换中...';
+            try {
+                const res = await fetch('/api/rotate', { method: 'POST' });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+                await fetchMetrics();
+                await loadProxyRouteStatus();
+                document.getElementById('location').textContent = data.verified_ip ? `已切换：${data.verified_ip}` : '轮换请求已完成';
+            } catch (e) {
+                alert('❌ IP 轮换失败：' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalText;
+            }
+        }
+
+        // ---------- 订阅管理 ----------
+        async function loadSubscriptions() {
+            try {
+                const res = await fetch('/api/panel/subscriptions');
+                const subs = await res.json();
+                const body = document.getElementById('sub-table-body');
+                if (!subs || subs.length === 0) {
+                    body.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-slate-400 italic font-sans text-xs">暂无订阅，请在上面添加或使用免费节点。</td></tr>';
+                } else {
+                    body.innerHTML = subs.map(s => `<tr class="hover:bg-slate-50/60 transition-colors">
+                        <td class="px-4 py-2.5 font-sans font-medium text-slate-900">${s.name}</td>
+                        <td class="px-4 py-2.5">${s.node_count}</td>
+                        <td class="px-4 py-2.5 text-slate-400">${s.interval}s</td>
+                        <td class="px-4 py-2.5 text-slate-400 max-w-[280px] truncate" title="${s.url}">${s.url}</td>
+                        <td class="px-4 py-2.5 text-right"><button onclick="removeSubscription('${s.name}')" class="px-2 py-1 border border-rose-200 text-rose-600 rounded text-[11px] bg-white hover:bg-rose-50">删除</button></td>
+                    </tr>`).join('');
+                }
+            } catch (e) {
+                document.getElementById('sub-table-body').innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-rose-400 font-sans text-xs">加载订阅失败，请刷新重试。</td></tr>';
+            }
+            loadFreeNodeStatus();
+        }
+
+        function toggleFreeRegionSelector() {
+            const mode = document.getElementById('free-region-mode').value;
+            document.getElementById('free-region-select').disabled = mode !== 'manual';
+        }
+
+        function renderFreeRegionOptions(options) {
+            const select = document.getElementById('free-region-select');
+            if (!select) return;
+            const fallback = [
+                {value: "all", label: "全部国家/地区"},
+                {value: "at", label: "🇦🇹 AT Austria"},
+                {value: "au", label: "🇦🇺 AU Australia"},
+                {value: "bg", label: "🇧🇬 BG Bulgaria"},
+                {value: "br", label: "🇧🇷 BR Brazil"},
+                {value: "ca", label: "🇨🇦 CA Canada"},
+                {value: "ch", label: "🇨🇭 CH Switzerland"},
+                {value: "cz", label: "🇨🇿 CZ Czech Republic"},
+                {value: "de", label: "🇩🇪 DE Germany"},
+                {value: "es", label: "🇪🇸 ES Spain"},
+                {value: "fi", label: "🇫🇮 FI Finland"},
+                {value: "fr", label: "🇫🇷 FR France"},
+                {value: "gb", label: "🇬🇧 GB United Kingdom"},
+                {value: "hk", label: "🇭🇰 HK Hong Kong"},
+                {value: "hu", label: "🇭🇺 HU Hungary"},
+                {value: "id", label: "🇮🇩 ID Indonesia"},
+                {value: "il", label: "🇮🇱 IL Israel"},
+                {value: "in", label: "🇮🇳 IN India"},
+                {value: "ir", label: "🇮🇷 IR Iran"},
+                {value: "it", label: "🇮🇹 IT Italy"},
+                {value: "jp", label: "🇯🇵 JP Japan"},
+                {value: "kr", label: "🇰🇷 KR South Korea"},
+                {value: "kz", label: "🇰🇿 KZ Kazakhstan"},
+                {value: "lt", label: "🇱🇹 LT Lithuania"},
+                {value: "md", label: "🇲🇩 MD Moldova"},
+                {value: "nl", label: "🇳🇱 NL Netherlands"},
+                {value: "pl", label: "🇵🇱 PL Poland"},
+                {value: "pt", label: "🇵🇹 PT Portugal"},
+                {value: "rs", label: "🇷🇸 RS Serbia"},
+                {value: "ru", label: "🇷🇺 RU Russia"},
+                {value: "se", label: "🇸🇪 SE Sweden"},
+                {value: "sg", label: "🇸🇬 SG Singapore"},
+                {value: "si", label: "🇸🇮 SI Slovenia"},
+                {value: "tr", label: "🇹🇷 TR Turkey"},
+                {value: "ua", label: "🇺🇦 UA Ukraine"},
+                {value: "us", label: "🇺🇸 US United States"},
+                {value: "vn", label: "🇻🇳 VN Vietnam"}
+            ];
+            const merged = [...fallback, ...(Array.isArray(options) ? options : [])];
+            const unique = [...new Map(merged.filter(item => item && item.value).map(item => [item.value, item])).values()];
+            select.innerHTML = unique.map(item => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join('');
+        }
+
+        async function loadFreeNodeStatus() {
+            try {
+                const res = await fetch('/api/panel/free-nodes');
+                const data = await res.json();
+                const badge = document.getElementById('free-node-badge');
+                renderFreeRegionOptions(data.region_options || []);
+                document.getElementById('free-region-mode').value = data.region_mode || 'auto';
+                if (data.region) document.getElementById('free-region-select').value = data.region;
+                toggleFreeRegionSelector();
+                if (data.enabled) {
+                    badge.textContent = `已启用 · ${data.node_count} 节点`;
+                    badge.className = 'bg-emerald-50 text-emerald-600 text-[10px] font-mono font-medium px-2 py-0.5 rounded border border-emerald-200';
+                } else {
+                    badge.textContent = '未启用';
+                    badge.className = 'bg-white text-slate-500 text-[10px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200';
+                }
+            } catch (e) {}
+        }
+
+        async function fetchFreeNodes() {
+            const msg = document.getElementById('free-node-msg');
+            const btn = event.currentTarget;
+            const mode = document.getElementById('free-region-mode').value;
+            const region = document.getElementById('free-region-select').value;
+            const maxNodes = Number(document.getElementById('free-max-nodes').value || 50);
+            btn.disabled = true;
+            const orig = btn.textContent;
+            btn.textContent = '抓取中...';
+            msg.textContent = '⏳ 正在读取 ConfigForge 节点源、转换并加入轮换池...';
+            try {
+                const res = await fetch('/api/panel/free-nodes/fetch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({region_mode: mode, region: mode === 'manual' ? region : null, max_nodes: maxNodes})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    const countryLabel = document.getElementById('free-region-select').selectedOptions[0]?.textContent || region;
+                    const regionText = data.region_mode === 'manual' ? `，国家/地区：${countryLabel}` : '，来源：全球轻量优选';
+                    msg.textContent = data.reload_ok
+                        ? `✅ 已启用免费节点（${data.node_count} 个${regionText}），配置已热重载`
+                        : `⚠️ 已生成免费节点（${data.node_count} 个${regionText}），但 mihomo 热重载未确认；节点管理将先显示本地缓存`;
+                    await loadFreeNodeStatus();
+                    await loadSubscriptions();
+                } else {
+                    msg.textContent = '❌ ' + (data.detail || '抓取失败');
+                }
+            } catch (e) {
+                msg.textContent = '❌ 请求失败';
+            }
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+
+        async function addSubscription() {
+            const url = document.getElementById('new-sub-url').value.trim();
+            const msg = document.getElementById('sub-msg');
+            if (!url) { msg.textContent = '请先粘贴订阅链接'; return; }
+            try {
+                const res = await fetch('/api/panel/subscriptions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url: url})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    const detail = (data.results || []).filter(item => !item.ok).map(item => `${item.name}: ${item.error}`).join('；');
+                    msg.textContent = detail ? `⚠️ ${data.name} 已保存，但刷新异常：${detail}` : `✅ 已添加订阅 ${data.name}，已刷新节点`;
+                    document.getElementById('new-sub-url').value = '';
+                    await loadSubscriptions();
+                    await loadNodes();
+                } else {
+                    msg.textContent = '❌ ' + (data.detail || '添加失败');
+                }
+            } catch (e) { msg.textContent = '❌ 请求失败'; }
+        }
+
+        async function removeSubscription(name) {
+            if (!confirm(`确定删除订阅 ${name} 吗？`)) return;
+            try {
+                const res = await fetch('/api/panel/subscriptions/' + encodeURIComponent(name), {method: 'DELETE'});
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.detail || '删除失败');
+                document.getElementById('sub-msg').textContent = `✅ 已删除 ${name}`;
+                await loadSubscriptions();
+                await loadNodes();
+            } catch (e) { document.getElementById('sub-msg').textContent = '❌ ' + e.message; }
+        }
+
+        async function refreshSubscriptions() {
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            const orig = btn.textContent;
+            btn.textContent = '刷新中...';
+            try {
+                const res = await fetch('/api/panel/refresh', {method: 'POST'});
+                const data = await res.json();
+                if (!res.ok) {
+                    const detail = data.detail || (data.results || []).filter(item => !item.ok).map(item => `${item.name}: ${item.error}`).join('；') || '刷新失败';
+                    throw new Error(detail);
+                }
+                document.getElementById('sub-msg').textContent = data.partial ? `⚠️ ${data.detail}` : `✅ 已刷新 ${data.ok_count || 0}/${data.total || 0} 个订阅`;
+                await loadSubscriptions();
+                await loadNodes();
+            } catch (e) {
+                document.getElementById('sub-msg').textContent = '❌ ' + e.message;
+            }
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+
+        // ---------- 节点管理 ----------
+        async function loadNodes(preserveSelection = nodeSelectionInitialized) {
+            try {
+                const previousSelection = new Set(nodeSelectionSet);
+                const res = await fetch('/api/panel/nodes');
+                const data = await res.json();
+                cachedNodes = data.nodes || [];
+                nodeEnabledSet = new Set(data.enabled || []);
+                const available = new Set(cachedNodes.map(node => node.name));
+                if (preserveSelection && nodeSelectionInitialized) {
+                    nodeSelectionSet = new Set([...previousSelection].filter(name => available.has(name)));
+                } else {
+                    nodeSelectionSet = nodeEnabledSet.size > 0
+                        ? new Set([...nodeEnabledSet].filter(name => available.has(name)))
+                        : new Set(cachedNodes.map(node => node.name));
+                    nodeSelectionInitialized = true;
+                }
+                const totalInActiveGroup = Number(data.active_group_node_count || 0);
+                const countBadge = document.getElementById('node-count-badge');
+                countBadge.textContent = data.active_group && totalInActiveGroup !== cachedNodes.length
+                    ? `${cachedNodes.length} / ${totalInActiveGroup} 个节点`
+                    : `${cachedNodes.length} 个节点`;
+                countBadge.title = data.active_group
+                    ? `当前应用组「${data.active_group}」快照共 ${totalInActiveGroup} 个节点，当前列表显示 ${cachedNodes.length} 个`
+                    : `当前列表共 ${cachedNodes.length} 个节点`;
+                const activeGroupBtn = document.getElementById('clear-active-group-btn');
+                if (activeGroupBtn) {
+                    activeGroupBtn.classList.toggle('hidden', !data.active_group);
+                    activeGroupBtn.textContent = data.active_group ? `退出应用组（${data.active_group}）` : '退出应用组';
+                }
+                updateCleanupButton();
+                updateGroupSelectedCount();
+                renderNodeTable();
+                const notices = [];
+                if (data.active_group) {
+                    const total = Number(data.active_group_node_count || 0);
+                    const missing = Number(data.active_group_missing_count || 0);
+                    const excluded = Number(data.active_group_excluded_count || 0);
+                    if (missing > 0) {
+                        const preview = (data.active_group_missing_nodes || []).slice(0, 3).join('、');
+                        notices.push(`⚠️ 当前应用组「${data.active_group}」快照有 ${total} 个节点，但订阅当前只提供 ${Number(data.active_group_provider_count || 0)} 个；缺少 ${missing} 个${preview ? `（如：${preview}）` : ''}。免费源更新后旧节点可能消失，请重新抓取免费节点或重建该组`);
+                    }
+                    if (excluded > 0) {
+                        notices.push(`⚠️ 组内另有 ${excluded} 个节点曾被“删除选中节点/清理失效实例”隐藏；重新应用该组可恢复显示`);
+                    }
+                    if (missing === 0 && excluded === 0) {
+                        notices.push(`✅ 当前应用组「${data.active_group}」共 ${total} 个节点；列表每页显示 ${PAGE_SIZE} 个，请使用底部翻页查看全部节点`);
+                    }
+                }
+                if (data.cached_node_count > 0) {
+                    const providers = (data.cached_providers || []).join('、');
+                    notices.push(`⚠️ 已从本地缓存显示 ${data.cached_node_count} 个节点${providers ? `（${providers}）` : ''}，mihomo 控制器尚未加载完成；请稍后再次刷新确认实时状态`);
+                }
+                if (notices.length > 0) setNodeHealthMessage(notices.join('；'));
+            } catch (e) {
+                document.getElementById('node-table-body').innerHTML = '<tr><td colspan="6" class="px-4 py-6 text-center text-rose-400 font-sans text-xs">加载节点失败。</td></tr>';
+            }
+        }
+
+        function renderNodeTable() {
+            const body = document.getElementById('node-table-body');
+            const total = cachedNodes.length;
+            const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+            if (currentNodePage > totalPages) currentNodePage = totalPages;
+            const start = (currentNodePage - 1) * PAGE_SIZE;
+            currentNodePageData = cachedNodes.slice(start, start + PAGE_SIZE);
+            if (currentNodePageData.length === 0) {
+                body.innerHTML = '<tr><td colspan="6" class="px-4 py-6 text-center text-slate-400 italic font-sans text-xs">暂无节点。</td></tr>';
+            } else {
+                body.innerHTML = currentNodePageData.map(n => {
+                    const checked = nodeSelectionSet.has(n.name);
+                    const delay = (n.delay === null || n.delay === undefined) ? '-' : n.delay;
+                    const delayColor = (typeof n.delay === 'number' && n.delay > 0 && n.delay < 300) ? 'text-emerald-600' : (typeof n.delay === 'number' && n.delay >= 300 ? 'text-amber-600' : 'text-slate-400');
+                    const failed = n.status === 'failed' || Number(n.fail_count || 0) >= 3;
+                    const status = failed
+                        ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded border border-rose-200 bg-rose-50 text-rose-600 text-[10px]">异常 · ${n.fail_count || 3}次</span>`
+                        : (n.status === 'suspect'
+                            ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded border border-amber-200 bg-amber-50 text-amber-600 text-[10px]">超时待确认 · ${n.fail_count || 1}/3</span>`
+                            : (n.status === 'ok'
+                                ? '<span class="inline-flex items-center px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-600 text-[10px]">正常</span>'
+                                : '<span class="inline-flex items-center px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50 text-slate-500 text-[10px]">未检测</span>'));
+                    return `<tr class="hover:bg-slate-50/60 transition-colors">
+                        <td class="px-4 py-2.5"><input type="checkbox" class="node-check w-4 h-4 accent-emerald-600" data-name="${escapeHtml(n.name)}" ${checked ? 'checked' : ''} onchange="onNodeCheck(event)"></td>
+                        <td class="px-4 py-2.5 font-mono font-medium text-slate-900">${escapeHtml(n.name)}</td>
+                        <td class="px-4 py-2.5 text-slate-400">${escapeHtml(n.provider || '')}</td>
+                        <td class="px-4 py-2.5 text-slate-400">${escapeHtml(n.type || '')}</td>
+                        <td class="px-4 py-2.5">${status}</td>
+                        <td class="px-4 py-2.5 text-right font-mono ${delayColor}">${delay}</td>
+                    </tr>`;
+                }).join('');
+            }
+            document.getElementById('node-page-info').innerText = `第 ${currentNodePage} / ${totalPages} 页 · 本页 ${currentNodePageData.length} 个 · 共 ${total} 个`;
+            document.getElementById('node-prev-btn').disabled = (currentNodePage <= 1);
+            document.getElementById('node-next-btn').disabled = (currentNodePage >= totalPages);
+        }
+
+        function changeNodePage(delta) { currentNodePage += delta; renderNodeTable(); }
+
+        function getSelectedNodes() {
+            return [...nodeSelectionSet];
+        }
+
+        function onNodeCheck(event) {
+            const checkbox = event.currentTarget;
+            if (checkbox.checked) nodeSelectionSet.add(checkbox.dataset.name);
+            else nodeSelectionSet.delete(checkbox.dataset.name);
+            updateGroupSelectedCount();
+        }
+
+        function selectAllNodes() {
+            nodeSelectionSet = new Set(cachedNodes.map(node => node.name));
+            renderNodeTable();
+            updateGroupSelectedCount();
+        }
+
+        function clearAllNodes() {
+            // “清除全选”只清空当前勾选状态，不删除节点。
+            nodeSelectionSet = new Set();
+            renderNodeTable();
+            updateGroupSelectedCount();
+        }
+
+        function getSelectedNodeNames() {
+            return [...nodeSelectionSet];
+        }
+
+        function setNodeHealthMessage(text) {
+            const msg = document.getElementById('node-health-msg');
+            if (msg) msg.textContent = text;
+        }
+
+        async function testSelectedDelay() {
+            const nodes = getSelectedNodeNames();
+            if (nodes.length === 0) { alert('请先选择要测量延迟的节点'); return; }
+            const btn = event.currentTarget;
+            const oldText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '测试中...';
+            try {
+                const res = await fetch('/api/panel/test-delay', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({nodes, mode: 'selected'})
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || '延迟测试失败');
+                cachedNodes.forEach(node => { if (data[node.name] !== undefined) node.delay = data[node.name]; });
+                window.nodeProbeCompleted = true;
+                await loadNodes(true);
+                const okCount = Object.values(data).filter(delay => Number(delay) > 0).length;
+                const failCount = nodes.length - okCount;
+                setNodeHealthMessage(failCount
+                    ? `⚠️ 选中节点测速完成：${okCount} 个正常，${failCount} 个连接失败；失败节点不会导致勾选状态改变`
+                    : `✅ 已完成 ${nodes.length} 个选中节点的延迟测试`);
+            } catch (e) { alert('❌ ' + e.message); }
+            finally { btn.disabled = false; btn.textContent = oldText; }
+        }
+
+        async function deleteSelectedNodes() {
+            const nodes = getSelectedNodeNames();
+            if (nodes.length === 0) { alert('请先选择要删除的节点'); return; }
+            if (!confirm(`确定删除选中的 ${nodes.length} 个节点吗？此操作不会删除订阅本身。`)) return;
+            try {
+                const res = await fetch('/api/panel/nodes/delete', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({nodes})
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || '删除失败');
+                window.nodeProbeCompleted = false;
+                await loadNodes();
+                alert(`✅ 已删除 ${data.count || 0} 个节点`);
+            } catch (e) { alert('❌ ' + e.message); }
+        }
+
+        async function refreshNodeList() {
+            const btn = event.currentTarget;
+            const oldText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '刷新中...';
+            try {
+                const refreshRes = await fetch('/api/panel/refresh', {method: 'POST'});
+                const refreshData = await refreshRes.json();
+                if (!refreshRes.ok) throw new Error(refreshData.detail || refreshData.error || '刷新订阅失败');
+                await new Promise(resolve => setTimeout(resolve, 1200));
+                window.nodeProbeCompleted = false;
+                await loadNodes();
+                if (!refreshData.partial) setNodeHealthMessage('✅ 节点列表已刷新');
+            } catch (e) { alert('❌ ' + e.message); }
+            finally { btn.disabled = false; btn.textContent = oldText; }
+        }
+
+        async function clearActiveGroup() {
+            if (!confirm('退出当前应用组并显示全部订阅节点吗？')) return;
+            const btn = document.getElementById('clear-active-group-btn');
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch('/api/panel/nodes/clear-active-group', {method: 'POST'});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || '退出应用组失败');
+                nodeSelectionSet = new Set();
+                nodeSelectionInitialized = false;
+                await loadNodes(false);
+                setNodeHealthMessage('✅ 已退出应用组，已恢复显示全部订阅节点');
+            } catch (e) {
+                alert('❌ ' + e.message);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        function updateGroupSelectedCount() {
+            const n = getSelectedNodes().length;
+            document.getElementById('group-selected-count').textContent = n;
+        }
+
+        async function saveNodeSelection() {
+            const enabled = getSelectedNodes();
+            const btn = document.querySelector('#tab-nodes .bg-emerald-600');
+            try {
+                const res = await fetch('/api/panel/nodes', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({enabled: enabled})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    alert('✅ 已保存 ' + enabled.length + ' 个启用节点，轮换配置已热重载');
+                } else {
+                    alert('❌ ' + (data.detail || '保存失败'));
+                }
+            } catch (e) { alert('❌ 请求失败'); }
+        }
+
+        function updateCleanupButton() {
+            const btn = document.getElementById('cleanup-failed-btn');
+            if (!btn) return;
+            const count = cachedNodes.filter(n => n.status === 'failed' || Number(n.fail_count || 0) >= 3).length;
+            btn.classList.toggle('hidden', !window.nodeProbeCompleted);
+            btn.disabled = count === 0;
+            btn.classList.toggle('opacity-50', count === 0);
+            btn.classList.toggle('cursor-not-allowed', count === 0);
+            btn.textContent = count ? `一键清理失效实例（${count}）` : '未发现失效实例';
+        }
+
+        async function testAllDelay() {
+            const msg = document.getElementById('node-health-msg');
+            const btn = event.currentTarget;
+            if (msg) msg.textContent = '⏳ 正在创建批量测速任务；节点较多时会分批排队，请耐心等候...';
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/panel/test-delay', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({nodes: cachedNodes.map(n => n.name), background: true})
+                });
+                const job = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(job.error || job.detail || '探测请求失败');
+                let delays = job;
+                if (job.job_id) {
+                    let finished = false;
+                    while (!finished) {
+                        const statusRes = await fetch(`/api/panel/test-delay/${encodeURIComponent(job.job_id)}`);
+                        const status = await statusRes.json().catch(() => ({}));
+                        if (!statusRes.ok) throw new Error(status.error || status.detail || '读取测速进度失败');
+                        if (msg && status.status === 'running') msg.textContent = `⏳ ${status.message || '正在分批探测节点'}（${status.completed || 0}/${status.total || '...'}，${status.progress || 0}%）`;
+                        if (status.status === 'completed') {
+                            delays = status.result || {};
+                            finished = true;
+                        } else if (status.status === 'failed') {
+                            throw new Error(status.error || status.message || '延迟测试失败');
+                        } else {
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                    }
+                }
+                cachedNodes.forEach(n => { if (delays[n.name] !== undefined) n.delay = delays[n.name]; });
+                window.nodeProbeCompleted = true;
+                await loadNodes(true);
+                if (msg) msg.textContent = '✅ 延迟测试完成；单次超时会先标记“待确认”，连续 3 次失败才判定异常';
+                updateCleanupButton();
+            } catch (e) {
+                if (msg) msg.textContent = '❌ 延迟测试失败';
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function cleanupFailedNodes() {
+            const failed = cachedNodes.filter(n => n.status === 'failed' || Number(n.fail_count || 0) >= 3).length;
+            if (!failed || !confirm(`将清理 ${failed} 个失效实例，并从当前轮换集合中移除，确定继续吗？`)) return;
+            const btn = document.getElementById('cleanup-failed-btn');
+            btn.disabled = true;
+            btn.textContent = '清理中...';
+            try {
+                const res = await fetch('/api/panel/nodes/cleanup-failed', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({})
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || '清理失败');
+                window.nodeProbeCompleted = false;
+                await loadNodes();
+                const msg = document.getElementById('node-health-msg');
+                if (msg) msg.textContent = `✅ 已清理 ${data.count || 0} 个失效实例，配置已热重载`;
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = '一键清理失效实例';
+                alert('❌ ' + e.message);
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
+        // ---------- 节点组 ----------
+        async function loadGroups() {
+            try {
+                const res = await fetch('/api/panel/groups', {cache: 'no-store'});
+                const data = await res.json();
+                const groups = data.groups || {};
+                const body = document.getElementById('group-table-body');
+                const names = Object.keys(groups);
+                if (names.length === 0) {
+                    body.innerHTML = '<tr><td colspan="3" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无节点组。</td></tr>';
+                    return;
+                }
+                body.innerHTML = names.map(name => `<tr class="hover:bg-slate-50/60 transition-colors">
+                    <td class="px-5 py-2.5 font-sans font-medium text-slate-900">${escapeHtml(name)}</td>
+                    <td class="px-5 py-2.5">${groups[name].length} 个</td>
+                    <td class="px-5 py-2.5 text-right space-x-1">
+                        <button onclick="applyGroup('${escapeHtml(name)}')" class="px-2 py-1 border border-emerald-200 text-emerald-600 rounded text-[11px] bg-white hover:bg-emerald-50">应用组</button>
+                        <button onclick="deleteGroup('${escapeHtml(name)}')" class="px-2 py-1 border border-rose-200 text-rose-600 rounded text-[11px] bg-white hover:bg-rose-50">删除</button>
+                    </td>
+                </tr>`).join('');
+            } catch (e) {}
+        }
+
+        async function saveCurrentGroup() {
+            const name = document.getElementById('new-group-name').value.trim();
+            const msg = document.getElementById('group-msg');
+            const nodes = getSelectedNodes();
+            if (!name) { msg.textContent = '请填写组名'; return; }
+            if (nodes.length === 0) { msg.textContent = '请先勾选至少 1 个节点'; return; }
+            try {
+                const res = await fetch('/api/panel/groups', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: name, nodes: nodes})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    msg.textContent = `✅ 已创建组「${name}」（${nodes.length} 个节点）`;
+                    document.getElementById('new-group-name').value = '';
+                    loadGroups();
+                } else {
+                    msg.textContent = '❌ ' + (data.detail || '创建失败');
+                }
+            } catch (e) { msg.textContent = '❌ 请求失败'; }
+        }
+
+        async function extractHealthyGroup(btn) {
+            const msg = document.getElementById('extract-group-msg');
+            const oldText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '任务进行中...';
+            msg.className = 'text-[11px] text-amber-600';
+            msg.textContent = '⏳ 正在创建后台探测任务；节点较多时会分批排队，页面不会因等待过久而误报失败...';
+            try {
+                const res = await fetch('/api/panel/groups/extract-healthy', {method: 'POST'});
+                const job = await res.json().catch(() => ({}));
+                if (!res.ok || !job.job_id) throw new Error(job.error || job.detail || '未能创建探测任务');
+                const jobId = job.job_id;
+                let finished = false;
+                while (!finished) {
+                    const statusRes = await fetch(`/api/panel/groups/extract-healthy/${encodeURIComponent(jobId)}`);
+                    const data = await statusRes.json().catch(() => ({}));
+                    if (!statusRes.ok) throw new Error(data.error || data.detail || '读取探测进度失败');
+                    const completed = Number(data.completed || 0);
+                    const total = Number(data.total || 0);
+                    const progress = Number(data.progress || 0);
+                    if (data.status === 'queued') {
+                        msg.textContent = '⏳ 探测任务已排队，正在等待 mihomo 资源...';
+                    } else if (data.status === 'running') {
+                        msg.textContent = `⏳ ${data.message || '正在分批探测节点'}（${completed}/${total || '...'}，${progress}%）`;
+                    } else if (data.status === 'completed') {
+                        const result = data.result || {};
+                        msg.className = 'text-[11px] text-emerald-600';
+                        msg.textContent = `✅ 已生成「${result.group}」：检查 ${result.measured_count || 0} 个（复用 ${result.cached_healthy_count || 0}，补测 ${result.probed_count || 0}），可用 ${result.healthy_count || 0} 个，失败 ${result.failed_count || 0} 个`;
+                        window.nodeProbeCompleted = true;
+                        await Promise.all([loadGroups(), loadNodes(true)]);
+                        finished = true;
+                    } else if (data.status === 'failed') {
+                        const result = data.result || data;
+                        throw new Error(result.error || data.message || '未能生成可用节点组');
+                    }
+                    if (!finished) await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            } catch (e) {
+                msg.className = 'text-[11px] text-rose-600';
+                msg.textContent = '❌ ' + e.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = oldText;
+            }
+        }
+
+        async function applyGroup(name) {
+            if (!confirm(`将「${name}」的节点设为轮换集合？`)) return;
+            try {
+                const res = await fetch('/api/panel/groups/apply', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: name})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    alert(`✅ 已应用组「${name}」（${data.node_count || 0} 个节点），ROTATOR 现在只使用该组节点`);
+                    // 应用组是一次明确的选择替换：节点管理只展示组快照。
+                    nodeSelectionSet = new Set(data.nodes || []);
+                    nodeSelectionInitialized = true;
+                    await loadNodes(false);
+                } else if (res.status === 409 && data.code === 'group_nodes_missing') {
+                    const missing = Array.isArray(data.missing_nodes) ? data.missing_nodes : [];
+                    const deletedSubscriptions = Array.isArray(data.missing_subscriptions) ? data.missing_subscriptions : [];
+                    const preview = missing.slice(0, 8).join('、');
+                    const suffix = missing.length > 8 ? ` 等 ${missing.length} 个节点` : '';
+                    const sourceText = deletedSubscriptions.length ? `\n被删除的订阅：${deletedSubscriptions.join('、')}\n` : '';
+                    const message = `⚠️ 组「${name}」中有 ${data.missing_count || missing.length} 个节点所属订阅已删除或节点已失效。${sourceText}\n请重新导入对应订阅后再应用。\n失效节点：${preview}${suffix}\n\n是否删除该组？`;
+                    if (confirm(message)) {
+                        const deleteRes = await fetch('/api/panel/groups/' + encodeURIComponent(name), {method: 'DELETE'});
+                        if (!deleteRes.ok) throw new Error('删除失效组失败');
+                        await loadGroups();
+                        alert(`✅ 已删除失效节点组「${name}」`);
+                    }
+                } else {
+                    alert('❌ ' + (data.detail || data.error || '应用失败'));
+                }
+            } catch (e) { alert('❌ ' + e.message); }
+        }
+
+        async function deleteGroup(name) {
+            if (!confirm(`确定删除组「${name}」吗？`)) return;
+            try {
+                await fetch('/api/panel/groups/' + encodeURIComponent(name), {method: 'DELETE'});
+                loadGroups();
+            } catch (e) {}
+        }
+
+        // ---------- 模型测试 ----------
+        async function fetchModels() {
+            const listEl = document.getElementById('model-list');
+            listEl.innerHTML = '<p class="text-xs text-slate-400">拉取中...</p>';
+            try {
+                const res = await fetch('/v1/models');
+                const data = await res.json();
+                cachedModels = (data.data || []).map(m => m.id);
+                const select = document.getElementById('test-model-select');
+                if (cachedModels.length === 0) {
+                    listEl.innerHTML = '<p class="text-xs text-slate-400">没有可用的免费模型。</p>';
+                    return;
+                }
+                select.innerHTML = cachedModels.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+                listEl.innerHTML = cachedModels.map(m =>
+                    `<div class="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+                        <span class="font-mono text-[11px] text-slate-700">${escapeHtml(m)}</span>
+                        <span class="text-[10px] bg-emerald-50 text-emerald-600 border border-emerald-200 px-1.5 py-0.5 rounded">免费</span>
+                    </div>`).join('');
+            } catch (e) {
+                listEl.innerHTML = '<p class="text-xs text-rose-400">拉取模型失败。</p>';
+            }
+        }
+
+        async function testModelConnectivity() {
+            const model = document.getElementById('test-model-select').value;
+            const out = document.getElementById('test-result');
+            if (!model) { out.textContent = '请先拉取模型并选择一个模型。'; return; }
+            out.textContent = `⏳ 正在通过当前节点向 ${model} 发送测试请求...`;
+            const started = Date.now();
+            try {
+                const res = await fetch('/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        model: model,
+                        messages: [{role: 'user', content: 'HI!'}],
+                        max_tokens: 20
+                    })
+                });
+                const elapsed = ((Date.now() - started) / 1000).toFixed(2);
+                const data = await res.json();
+                if (res.ok && data.choices && data.choices[0]) {
+                    const content = data.choices[0].message ? (data.choices[0].message.content || '') : '';
+                    out.textContent = `✅ 测试成功（${elapsed}s）\n模型: ${model}\n回复: ${content}\n用量: ${JSON.stringify(data.usage || {})}`;
+                } else {
+                    out.textContent = `❌ 测试失败（${elapsed}s）\nHTTP ${res.status}\n${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (e) {
+                out.textContent = '❌ 请求异常: ' + e.message;
+            }
+        }
+
+        async function testSelectedNode() {
+            const out = document.getElementById('test-result');
+            out.textContent = '⏳ 正在测试模型请求当前实际出口的延迟...';
+            try {
+                const res = await fetch('/api/panel/current-node-delay', {method: 'POST'});
+                const data = await res.json();
+                const source = data.egress === 'proxy' ? '代理池节点' : 'mihomo ROTATOR 节点';
+                if (!res.ok || !data.ok) {
+                    const detail = data.node ? `${source}：${data.node}\n` : '';
+                    out.textContent = `❌ 延迟测试失败\n${detail}${data.error || '当前出口测试失败'}`;
+                    return;
+                }
+                const note = data.note ? `\n说明：${data.note}` : '';
+                out.textContent = `✅ 当前出口：${source}\n节点：${data.node}\n延迟：${data.delay} ms${note}`;
+                loadProxyRouteStatus();
+            } catch (e) {
+                out.textContent = '❌ 延迟测试请求异常: ' + e.message;
+            }
+        }
+
+        // ---------- 代理池管理 ----------
+        function proxyStatusBadge(status) {
+            const map = {
+                'ok': ['bg-emerald-50 text-emerald-600 border-emerald-200', '正常'],
+                'fail': ['bg-rose-50 text-rose-600 border-rose-200', '异常'],
+                'cooldown': ['bg-amber-50 text-amber-600 border-amber-200', '冷却中'],
+                'untested': ['bg-slate-50 text-slate-500 border-slate-200', '未检测'],
+            };
+            const [cls, label] = map[status] || map['untested'];
+            return `<span class="inline-flex items-center px-2 py-0.5 rounded-full border text-[10px] font-medium ${cls}">${label}</span>`;
+        }
+
+        function formatCooldown(ts) {
+            if (!ts) return '-';
+            const d = new Date(ts * 1000);
+            const p = n => String(n).padStart(2, '0');
+            return `${d.getMonth()+1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        }
+
+        async function loadProxyRouteStatus() {
+            const el = document.getElementById('proxy-route-msg');
+            if (!el) return;
+            try {
+                const res = await fetch('/api/panel/egress');
+                const data = await res.json();
+                if (data.mode === 'proxy' && data.active_proxy) {
+                    el.textContent = `当前模型出口：代理池 · ${data.active_proxy}（可用 ${data.eligible_count}/${data.total}）`;
+                    el.className = 'text-[11px] text-emerald-600 mt-1';
+                } else {
+                    el.textContent = `当前模型出口：mihomo ROTATOR（代理池可用 ${data.eligible_count || 0}/${data.total || 0}）`;
+                    el.className = 'text-[11px] text-amber-600 mt-1';
+                }
+            } catch (e) {
+                el.textContent = '当前模型出口状态读取失败';
+                el.className = 'text-[11px] text-rose-500 mt-1';
+            }
+        }
+
+        async function loadProxies() {
+            try {
+                const res = await fetch('/api/panel/proxies');
+                const data = await res.json();
+                const body = document.getElementById('proxy-table-body');
+                document.getElementById('proxy-count-badge').textContent = (data.total || 0) + ' 个';
+                loadProxyRouteStatus();
+                if (!data.proxies || data.proxies.length === 0) {
+                    body.innerHTML = '<tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无代理，请在上方添加。</td></tr>';
+                    return;
+                }
+                body.innerHTML = data.proxies.map(p => {
+                    const latency = (p.latency === null || p.latency === undefined) ? '-' : p.latency + ' ms';
+                    const latClass = (p.latency !== null && p.latency !== undefined && p.latency < 500) ? 'text-emerald-600' : 'text-slate-600';
+                    return `<tr class="hover:bg-slate-50/60 transition-colors">
+                        <td class="px-5 py-2.5 font-mono text-slate-800 max-w-[340px] truncate" title="${escapeHtml(p.addr)}">${escapeHtml(p.addr)}</td>
+                        <td class="px-5 py-2.5">${proxyStatusBadge(p.status)}${p.status === 'cooldown' && p.cooldown_remain ? `<span class="ml-1 text-[10px] text-amber-500">${p.cooldown_remain}s</span>` : ''}</td>
+                        <td class="px-5 py-2.5 text-right font-mono ${latClass}">${latency}</td>
+                        <td class="px-5 py-2.5 text-right text-slate-500 font-mono">${p.fail_count}</td>
+                        <td class="px-5 py-2.5 text-slate-400 font-mono">${formatCooldown(p.cooldown_until)}</td>
+                        <td class="px-5 py-2.5 text-right space-x-1.5">
+                            <button onclick="checkOneProxy('${escapeHtml(p.addr)}')" class="px-2 py-1 border border-slate-200 text-slate-600 rounded text-[11px] bg-white hover:bg-slate-50">Check</button>
+                            <button onclick="removeProxy('${escapeHtml(p.addr)}')" class="px-2 py-1 text-rose-600 rounded text-[11px] bg-transparent hover:bg-rose-50">删除</button>
+                        </td>
+                    </tr>`;
+                }).join('');
+            } catch (e) {
+                document.getElementById('proxy-table-body').innerHTML = '<tr><td colspan="6" class="px-5 py-6 text-center text-rose-400 font-sans text-xs">加载代理失败。</td></tr>';
+            }
+        }
+
+        async function addProxies() {
+            const text = document.getElementById('proxy-input').value;
+            const msg = document.getElementById('proxy-msg');
+            if (!text.trim()) { msg.textContent = '请先输入代理地址'; return; }
+            try {
+                const res = await fetch('/api/panel/proxies', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: text})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    const parts = [`✅ 已添加 ${data.added.length} 个代理`];
+                    if (data.skipped && data.skipped.length) parts.push(`跳过 ${data.skipped.length} 个无效格式`);
+                    msg.textContent = parts.join('，');
+                    document.getElementById('proxy-input').value = '';
+                    loadProxies();
+                } else {
+                    msg.textContent = '❌ ' + (data.detail || '添加失败');
+                }
+            } catch (e) { msg.textContent = '❌ 请求失败'; }
+        }
+
+        async function testInputProxies() {
+            const text = document.getElementById('proxy-input').value;
+            const msg = document.getElementById('proxy-msg');
+            const addrs = text.split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+            if (addrs.length === 0) { msg.textContent = '请先输入要测试的代理地址'; return; }
+            msg.textContent = `⏳ 正在测试 ${addrs.length} 个代理...`;
+            try {
+                const res = await fetch('/api/panel/proxies/check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({addrs: addrs})
+                });
+                const data = await res.json();
+                msg.textContent = `✅ 测试完成：${data.ok_count}/${data.total} 个可用`;
+                loadProxies();
+            } catch (e) { msg.textContent = '❌ 测试失败'; }
+        }
+
+        async function checkAllProxies() {
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            const orig = btn.textContent;
+            btn.textContent = '检测中...';
+            try {
+                const res = await fetch('/api/panel/proxies/check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({})
+                });
+                const data = await res.json();
+                document.getElementById('proxy-msg').textContent = `✅ 全部健康检查完成：${data.ok_count}/${data.total} 个可用`;
+                loadProxies();
+            } catch (e) {
+                document.getElementById('proxy-msg').textContent = '❌ 健康检查失败';
+            }
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+
+        async function checkOneProxy(addr) {
+            const msg = document.getElementById('proxy-msg');
+            msg.textContent = `⏳ 正在测试 ${addr} ...`;
+            try {
+                const res = await fetch('/api/panel/proxies/check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({addrs: [addr]})
+                });
+                const data = await res.json();
+                const r = data.results && data.results[0];
+                msg.textContent = r && r.ok ? `✅ ${addr} 可用（${r.latency}ms）` : `❌ ${addr} 不可用`;
+                loadProxies();
+            } catch (e) { msg.textContent = '❌ 测试失败'; }
+        }
+
+        async function removeProxy(addr) {
+            if (!confirm('确定删除该代理吗？')) return;
+            try {
+                await fetch('/api/panel/proxies/' + encodeURIComponent(addr), {method: 'DELETE'});
+                document.getElementById('proxy-msg').textContent = '已删除';
+                loadProxies();
+            } catch (e) {}
+        }
+
+        // ---------- 初始化 ----------
+        setInterval(fetchMetrics, 3000);
+        fetchMetrics();
+        switchTab('overview');
+        loadProxyRouteStatus();
+    </script>
+</body>
+</html>

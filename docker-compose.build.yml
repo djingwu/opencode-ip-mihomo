@@ -1,0 +1,21 @@
+# 本地源码构建覆盖文件
+# 用法：
+# docker compose -f docker-compose.mihomo.yml -f docker-compose.build.yml up -d --build
+services:
+  config-repair:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy.mihomo
+    image: opencode-ip-mihomo-proxy:local
+
+  proxy-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy.mihomo
+    image: opencode-ip-mihomo-proxy:local
+
+  rotator:
+    build:
+      context: .
+      dockerfile: Dockerfile.rotator
+    image: opencode-ip-mihomo-rotator:local

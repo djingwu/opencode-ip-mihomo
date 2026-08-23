@@ -1,0 +1,33 @@
+name: Test & Compose Validation
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+
+jobs:
+  test-and-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p "test_*.py" -q
+
+      - name: Validate production Compose
+        run: docker compose -f docker-compose.mihomo.yml config --quiet
+
+      - name: Validate local-build Compose
+        run: docker compose -f docker-compose.mihomo.yml -f docker-compose.build.yml config --quiet

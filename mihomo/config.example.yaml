@@ -1,0 +1,59 @@
+# ============================================================
+# mihomo (Clash Meta) 配置模板 — OpenCode IP Rotator 用（多订阅版）
+# 使用方法：
+#   1. 复制为 mihomo/config.yaml 后执行 docker compose up
+#   2. 通过控制台“添加订阅”，或运行 deploy.sh 输入真实订阅 URL
+#   说明：Clash Verge 里导出的节点配置格式与此完全通用
+# ============================================================
+
+# 混合端口：proxy-server 通过这里走代理出站
+# allow-lan 必须为 true：让 mixed-port 监听 0.0.0.0，否则独立容器访问不到
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+
+# 控制端口：rotator 通过这里切换节点（仅容器内网访问，勿映射到公网）
+external-controller: 0.0.0.0:9090
+secret: ""        # 建议设置一个随机字符串，并在 compose 中传给 rotator（MIHOMO_SECRET）
+
+# ------------------------------------------------------------------
+# 机场订阅：每个机场一个 provider（proxy-providers），节点全部汇入 ROTATOR 组
+# 注意：
+#   - 部分机场按 User-Agent 区分返回内容，默认已用 clash-verge UA（一般够用）
+#   - 不同机场尽量避免重名节点（mihomo 会按节点名去重，重名会丢节点）
+# ------------------------------------------------------------------
+proxy-providers: {}
+
+# 初始为空：请通过控制台“添加订阅”或 deploy.sh 输入真实订阅链接。
+# 不要把示例 URL 写入这里，否则 mihomo 会尝试加载占位地址并显示为 0 节点。
+
+# ------------------------------------------------------------------
+# 代理组：ROTATOR 是 rotator 负责切换的组
+# 默认 select 模式：429 时 rotator 显式切到下一个健康节点（可控）
+# 想要"每个请求自动换节点"可改用 load-balance 模式（见下方注释块）
+#
+# exclude-filter：排除"剩余流量/套餐到期/官网/客服"这类信息占位节点（能连通但不是真实出口）
+# ------------------------------------------------------------------
+proxy-groups:
+  - name: ROTATOR
+    type: select
+    exclude-filter: '(?i)剩余流量|剩余|重置|套餐到期|到期|过期|欠费|流量提醒|距离下次|官网|客服|邮箱|联系|公告|通知|群组|订阅更新|刷新订阅|连接不上|无法连接'
+    proxies:
+      - DIRECT
+
+  # ======= 备选：load-balance 模式（每个请求自动轮换节点，不用等 429） =======
+  # - name: ROTATOR
+  #   type: load-balance
+  #   strategy: round-robin          # round-robin: 按连接轮换；consistent-hashing: 按目标固定
+  #   disable-udp: false
+  #   exclude-filter: '(?i)剩余流量|剩余|重置|套餐到期|到期|过期|欠费|流量提醒|距离下次|官网|客服|邮箱|联系|公告|通知|群组|订阅更新|刷新订阅|连接不上|无法连接'
+  #   use: []
+
+# 全部流量走 ROTATOR 组
+rules:
+  - MATCH,ROTATOR

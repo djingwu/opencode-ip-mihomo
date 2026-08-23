@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# curl 用于容器 healthcheck
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (mihomo client: curl_cffi for TLS impersonation + FastAPI for the 8001 control API)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy rotator code (no WARP CLI needed — mihomo does the proxy switching)
+COPY rotator.py .
+COPY rate_limits.py .
+COPY proxy_utils.py .
+COPY proxy_pool.py .
+COPY manager.py .
+
+EXPOSE 8001
+
+CMD ["python", "rotator.py"]

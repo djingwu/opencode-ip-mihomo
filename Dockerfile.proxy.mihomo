@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies (no Cloudflare WARP needed — mihomo handles proxying)
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy server code, rotator helper, panel manager, free nodes fetcher, and dashboard template
+COPY server.py .
+COPY rate_limits.py .
+COPY proxy_utils.py .
+COPY proxy_pool.py .
+COPY rotator.py .
+COPY panel_manager.py .
+COPY free_nodes.py .
+COPY templates/ ./templates/
+
+EXPOSE 8000
+
+CMD ["python", "server.py"]

@@ -1,0 +1,15 @@
+# Build context exclusions
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+data/
+README.md
+LICENSE
+mihomo/
+providers/
+docs/
+tests/
+.vscode/
+.idea/
