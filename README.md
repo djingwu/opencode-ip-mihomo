@@ -1,6 +1,8 @@
 # OpenCode IP Mihomo
 
-一个面向 **OpenCode Zen**、OpenAI 兼容客户端和 Anthropic 客户端的 **mihomo 出口代理网关**。项目将机场订阅节点、可选**提供****免费节点**和 HTTP/HTTPS/SOCKS5 代理池统一纳入管理，并通过 ROTATOR 自动选择可用出口,它旨在防止 HTTP 429 速率限制，保证每个周期使用唯一的 IP 地址。
+[![Release](https://img.shields.io/badge/release-v1.0.0-0096D6?style=flat-square)](https://github.com/jiuwangka/opencode-ip-mihomo/releases/tag/v1.0.0) [![Docker](https://img.shields.io/badge/docker-microservices-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/u/jiuwangka) [![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11-2CA5E0?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+
+一个面向 **OpenCode Zen**、OpenAI 兼容客户端和 Anthropic 客户端的 **mihomo 出口代理网关**。项目将机场订阅节点、可选**提供**免费节点和 HTTP/HTTPS/SOCKS5 代理池统一纳入管理，并通过 ROTATOR 自动选择可用出口,它旨在防止 HTTP 429 速率限制，保证每个周期使用唯一的 IP 地址。
 
 > 本项目只提供网关、节点管理和出口调度能力，不提供模型账号或代理资源。请自行确认上游服务、订阅和代理的使用权限，免费节点不保证可用性。
 
@@ -81,10 +83,14 @@ mkdir -p data mihomo/providers
 touch data/proxies.txt
 cp mihomo/config.example.yaml mihomo/config.yaml
 
-cat > .env <<'EOF'
+# 生成控制器密钥，并同时写入 mihomo 配置和 Compose 环境变量
+MIHOMO_SECRET="$(openssl rand -hex 32)"
+sed -i "s/^secret:.*/secret: \"${MIHOMO_SECRET}\"/" mihomo/config.yaml
+
+cat > .env <<EOF
 BIND_IP=127.0.0.1
 GATEWAY_PORT=24513
-MIHOMO_SECRET=请替换为随机密钥
+MIHOMO_SECRET=${MIHOMO_SECRET}
 EOF
 
 docker compose \
@@ -110,28 +116,31 @@ jiuwangka/opencode-ip-mihomo-rotator:latest
 metacubex/mihomo:latest
 ```
 
-先准备项目目录和运行配置：
+无需克隆整个源码仓库，只需下载 Compose 文件和 mihomo 初始配置：
 
 ```bash
-git clone https://github.com/jiuwangka/opencode-ip-mihomo.git
-cd opencode-ip-mihomo
-mkdir -p data mihomo/providers
-touch data/proxies.txt
-cp mihomo/config.example.yaml mihomo/config.yaml
+mkdir -p /root/opencode-ip-mihomo/mihomo/providers
+cd /root/opencode-ip-mihomo
+
+curl -fsSL \
+  https://raw.githubusercontent.com/jiuwangka/opencode-ip-mihomo/master/docker-compose.mihomo.yml \
+  -o docker-compose.mihomo.yml
+
+curl -fsSL \
+  https://raw.githubusercontent.com/jiuwangka/opencode-ip-mihomo/master/mihomo/config.example.yaml \
+  -o mihomo/config.yaml
 
 cat > .env <<'EOF'
 BIND_IP=127.0.0.1
 GATEWAY_PORT=24513
-MIHOMO_SECRET=请替换为随机密钥
+MIHOMO_SECRET=
 EOF
-```
 
-拉取并启动：
-
-```bash
 docker compose -f docker-compose.mihomo.yml pull
 docker compose -f docker-compose.mihomo.yml up -d
 ```
+
+`MIHOMO_SECRET` 必须与 `mihomo/config.yaml` 中的 `secret` 完全一致。默认模板的 `secret` 为空，且控制器端口不映射到宿主机，因此以上配置保持为空即可。
 
 推荐使用 SSH 隧道访问面板：
 
