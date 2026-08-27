@@ -419,11 +419,11 @@ def swap_warp_registration():
 MODEL_PRICING = {
     "deepseek-v4-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.60},
     "mimo-v2.5-free": {"input_per_1m": 0.20, "output_per_1m": 0.80},
-    "qwen3.6-plus-free": {"input_per_1m": 0.40, "output_per_1m": 1.20},
-    "minimax-m3-free": {"input_per_1m": 0.30, "output_per_1m": 1.00},
     "nemotron-3-ultra-free": {"input_per_1m": 0.25, "output_per_1m": 0.90},
-    "ling-3.0-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.50},
     "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
+    "hy3-free": {"input_per_1m": 0.15, "output_per_1m": 0.50},
+    "muse-spark-1.2-contributor-free": {"input_per_1m": 0.10, "output_per_1m": 0.40},
+    "nemotron-3.5-lightning-free": {"input_per_1m": 0.18, "output_per_1m": 0.60},
 }
 
 _model_usage_lock = threading.Lock()
@@ -548,10 +548,16 @@ metrics = {
 DEFAULT_FREE_MODELS = [
     {"id": "deepseek-v4-flash-free", "name": "DeepSeek V4 Flash Free"},
     {"id": "mimo-v2.5-free", "name": "MiMo V2.5 Free"},
-    {"id": "qwen3.6-plus-free", "name": "Qwen 3.6 Plus Free"},
-    {"id": "minimax-m3-free", "name": "MiniMax M3 Free"},
     {"id": "nemotron-3-ultra-free", "name": "Nemotron 3 Ultra Free"},
+    {"id": "nemotron-3.5-lightning-free", "name": "Nemotron 3.5 Lightning Free"},
+    {"id": "laguna-s-2.1-free", "name": "Laguna S 2.1 Free"},
+    {"id": "hy3-free", "name": "HY3 Free"},
+    {"id": "muse-spark-1.2-contributor-free", "name": "Muse Spark 1.2 Contributor Free"},
 ]
+
+# 默认请求模型（可通过 DEFAULT_MODEL 覆盖）。上游 /models 返回的真实 free 模型会
+# 在自动发现后整体替换 DEFAULT_FREE_MODELS；此处仅作为发现失败时的兜底默认值。
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek-v4-flash-free")
 
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
@@ -681,7 +687,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field(default="deepseek-v4-flash-free")
+    model: str = Field(default=DEFAULT_MODEL)
     messages: List[ChatMessage]
     stream: Optional[bool] = False
     temperature: Optional[float] = 0.7
@@ -1596,7 +1602,7 @@ async def chat_completions(raw_request: Request):
     except Exception:
         payload = {}
 
-    current_model = payload.get("model", "deepseek-v4-flash-free")
+    current_model = payload.get("model", DEFAULT_MODEL)
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
@@ -1727,7 +1733,7 @@ async def anthropic_messages(raw_request: Request):
         body = {}
 
     body = normalize_anthropic_request(body)
-    model_name = body.get("model", "deepseek-v4-flash-free")
+    model_name = body.get("model", DEFAULT_MODEL)
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
 
@@ -1846,7 +1852,7 @@ async def responses_endpoint(raw_request: Request):
     except Exception:
         body = {}
 
-    model_name = body.get("model", "deepseek-v4-flash-free")
+    model_name = body.get("model", DEFAULT_MODEL)
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
 
