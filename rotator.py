@@ -27,6 +27,15 @@ import proxy_pool
 CHECK_ENDPOINT = os.environ.get("WARP_CHECK_ENDPOINT", "https://www.gstatic.com/generate_204")
 CHECK_INTERVAL = int(os.environ.get("WARP_CHECK_INTERVAL", "60"))
 PERIODIC_ROTATION_INTERVAL = int(os.environ.get("WARP_ROTATION_INTERVAL", "300"))
+# 定时轮换总开关：设为 false/0/no/off/disable 可关闭按间隔自动切换出口
+# （健康检查轮询不受影响，仍会探测并在异常时换出口）。
+ENABLE_PERIODIC_ROTATION = os.environ.get("WARP_ROTATION_ENABLED", "true").lower() not in (
+    "0", "false", "no", "off", "disable"
+)
+# 仅代理池轮换：开启后自动/手动轮换只从代理池取出口，完全禁用 mihomo 节点切换。
+ROTATION_PROXY_POOL_ONLY = os.environ.get("ROTATION_PROXY_POOL_ONLY", "").lower() in (
+    "1", "true", "yes", "on"
+)
 
 INITIAL_RETRY_DELAY = int(os.environ.get("WARP_RETRY_DELAY", "3"))
 MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
@@ -521,7 +530,11 @@ def rotate_combined_egress(reason: str) -> Optional[bool]:
     """
     proxies = proxy_pool.read_proxy_list()
     available = proxy_pool.eligible_proxies(proxies)
-    mihomo_nodes = mihomo_rotation_candidates() if is_mihomo_enabled() else []
+    if ROTATION_PROXY_POOL_ONLY:
+        # 仅代理池模式：完全排除 mihomo 节点，轮换只走代理池
+        mihomo_nodes = []
+    else:
+        mihomo_nodes = mihomo_rotation_candidates() if is_mihomo_enabled() else []
     if not proxies and not mihomo_nodes:
         return None
 
@@ -728,12 +741,16 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
 
     while not stop_event.is_set():
         try:
-            if is_mihomo_enabled() or proxy_pool.read_proxy_list():
+            route = proxy_pool.routing_snapshot()
+            active_proxy = route.get("active_proxy") if route.get("mode") == "proxy" else None
+            # 仅代理池模式：没有活跃代理时不做托管探测，避免误探测/误切 mihomo 出口。
+            managed = (is_mihomo_enabled() or proxy_pool.read_proxy_list()) and not (
+                ROTATION_PROXY_POOL_ONLY and not active_proxy
+            )
+            if managed:
                 # 检测当前统一出口：代理池模式检测当前 SOCKS/HTTP 代理，
                 # ROTATOR 模式才检测 mihomo，避免无关的 mihomo 故障误切代理池。
                 from curl_cffi import requests
-                route = proxy_pool.routing_snapshot()
-                active_proxy = route.get("active_proxy") if route.get("mode") == "proxy" else None
                 outbound = active_proxy or MIHOMO_OUTBOUND_PROXY
                 resp = requests.get(
                     endpoint,
@@ -824,7 +841,14 @@ def start_rotator_http_server():
         
         @rotator_app.get("/status")
         def http_status():
-            return {"current_ip": _current_ip, "rotations": rotation_count, "history": ip_history, **proxy_pool.routing_snapshot()}
+            return {
+                "current_ip": _current_ip,
+                "rotations": rotation_count,
+                "history": ip_history,
+                "periodic_rotation_enabled": ENABLE_PERIODIC_ROTATION,
+                "proxy_pool_only": ROTATION_PROXY_POOL_ONLY,
+                **proxy_pool.routing_snapshot(),
+            }
 
         uvicorn.run(rotator_app, host="0.0.0.0", port=8001, log_level="warning")
     except Exception as e:
@@ -873,11 +897,17 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
 
     health_thread = threading.Thread(target=health_check_loop, args=(CHECK_ENDPOINT, CHECK_INTERVAL, INITIAL_RETRY_DELAY, MAX_RETRIES, stop_event), daemon=True)
-    periodic_thread = threading.Thread(target=periodic_rotation_loop, args=(PERIODIC_ROTATION_INTERVAL, stop_event), daemon=True)
     http_thread = threading.Thread(target=start_rotator_http_server, daemon=True)
 
     health_thread.start()
-    periodic_thread.start()
+    if ENABLE_PERIODIC_ROTATION:
+        periodic_thread = threading.Thread(target=periodic_rotation_loop, args=(PERIODIC_ROTATION_INTERVAL, stop_event), daemon=True)
+        periodic_thread.start()
+        log.info("Periodic IP rotation is enabled (Interval: %ss).", PERIODIC_ROTATION_INTERVAL)
+    else:
+        log.info("Periodic IP rotation is DISABLED (WARP_ROTATION_ENABLED=false).")
+    if ROTATION_PROXY_POOL_ONLY:
+        log.info("Rotation is restricted to the proxy pool only (ROTATION_PROXY_POOL_ONLY=true); mihomo node switching disabled.")
     http_thread.start()
 
     try:

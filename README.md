@@ -226,6 +226,8 @@ http://127.0.0.1:24513/v1
 | `ROTATOR_IMAGE`            | `jiuwangka/opencode-ip-mihomo-rotator:latest` | rotator 镜像           |
 | `MIHOMO_MAX_LATENCY`       | `300`                                         | 节点延迟上限（毫秒）   |
 | `WARP_ROTATION_INTERVAL`   | `300`                                         | 自动轮换间隔（秒）     |
+| `WARP_ROTATION_ENABLED`    | `true`                                        | 定时轮换总开关（false 关闭自动轮换，健康检查仍生效） |
+| `ROTATION_PROXY_POOL_ONLY`| `false`                                       | 仅代理池轮换（true 时轮换只走代理池，禁用 mihomo 节点切换） |
 | `PANEL_LATENCY_TIMEOUT`    | `15000`                                       | 单节点测速超时（毫秒） |
 | `PANEL_LATENCY_WORKERS`    | `8`                                           | 测速并发数             |
 | `PANEL_LATENCY_BATCH_SIZE` | `40`                                          | 测速批次大小           |

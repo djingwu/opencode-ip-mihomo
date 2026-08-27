@@ -16,6 +16,8 @@
 #    MIHOMO_SECRET                 —— mihomo 控制密码
 #    MIHOMO_MAX_LATENCY            —— 节点延迟上限 ms（默认 300）
 #    WARP_ROTATION_INTERVAL        —— 定时轮换间隔 s（默认 300）
+#    WARP_ROTATION_ENABLED         —— 定时轮换总开关（默认 true，false 关闭自动轮换）
+#    ROTATION_PROXY_POOL_ONLY      —— 仅代理池轮换（默认 false，true 禁用 mihomo 节点切换）
 # ============================================================
 services:
   # 在 mihomo 读取配置前先迁移旧版 ROTATOR.proxies 节点快照。
@@ -121,6 +123,8 @@ services:
       - WARP_CHECK_ENDPOINT=${WARP_CHECK_ENDPOINT:-https://www.gstatic.com/generate_204}
       - WARP_CHECK_INTERVAL=${WARP_CHECK_INTERVAL:-60}
       - WARP_ROTATION_INTERVAL=${WARP_ROTATION_INTERVAL:-300}
+      - WARP_ROTATION_ENABLED=${WARP_ROTATION_ENABLED:-true}
+      - ROTATION_PROXY_POOL_ONLY=${ROTATION_PROXY_POOL_ONLY:-false}
       - METRICS_DB_PATH=/app/data/metrics.db
       - LOG_LEVEL=INFO
     healthcheck:
