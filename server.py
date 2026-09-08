@@ -45,7 +45,12 @@ MODEL_DISCOVERY_INTERVAL = 300
 DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
-STREAM_TIMEOUT = 600
+STREAM_TIMEOUT = 60
+
+# Per-model timeout overrides (seconds) for known slow models
+MODEL_TIMEOUT_OVERRIDES = {
+    "hy3-free": 30,  # hy3-free is very slow (~90s), cut it short
+}
 # Reasoning-heavy free models can consume a tiny Anthropic max_tokens budget
 # before emitting visible text. Keep the compatibility endpoint usable for
 # short connection tests while allowing deployments to override the floor.
@@ -144,6 +149,13 @@ def _get_conn():
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
+def _get_conn_row():
+    conn = sqlite3.connect(str(DB_FILE), timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
 def _db_execute(statement: str, params=()):
     for attempt in range(3):
         try:
@@ -166,7 +178,7 @@ def _db_fetchall(statement: str, params=()) -> list:
     for attempt in range(3):
         try:
             with _db_lock:
-                conn = _get_conn()
+                conn = _get_conn_row()
                 try:
                     cursor = conn.cursor()
                     cursor.execute(statement, params)
@@ -219,6 +231,21 @@ def init_db():
             expires_at REAL NOT NULL
         )
     """)
+    _db_execute("""
+        CREATE TABLE IF NOT EXISTS request_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            model TEXT NOT NULL,
+            proxy_ip TEXT,
+            egress_ip TEXT,
+            latency_ms REAL,
+            status TEXT NOT NULL,
+            is_stream INTEGER DEFAULT 0,
+            attempt INTEGER DEFAULT 1,
+            error_msg TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 def acquire_flow_lease() -> str:
@@ -236,6 +263,38 @@ def touch_flow_lease(lease_id: str) -> None:
 
 def release_flow_lease(lease_id: str) -> None:
     _db_execute("DELETE FROM active_flow_leases WHERE lease_id = ?", (lease_id,))
+
+def record_request_history(
+    model: str,
+    proxy_ip: str = "",
+    egress_ip: str = "",
+    latency_ms: float = 0,
+    status: str = "ok",
+    is_stream: bool = False,
+    attempt: int = 1,
+    error_msg: str = "",
+):
+    """Record a single request to the request_history table."""
+    try:
+        _db_execute(
+            """INSERT INTO request_history
+               (timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream, attempt, error_msg)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                model,
+                proxy_ip or "",
+                egress_ip or "",
+                latency_ms,
+                status,
+                1 if is_stream else 0,
+                attempt,
+                error_msg[:200] if error_msg else "",
+            ),
+        )
+    except Exception:
+        pass
+
 
 def log_ip_rotation_to_db(ip: str, country: str, flag: str, timestamp: str, reason: str):
     try:
@@ -317,6 +376,13 @@ def _get_session(endpoint: str):
             if not ENABLE_HTTP2:
                 from curl_cffi import CurlHttpVersion
                 kwargs["http_version"] = CurlHttpVersion.V1_1
+            # Disable low-speed limit (default 30s < 1byte/s) to avoid premature
+            # timeout on slow upstream responses. The upstream timeout is handled
+            # by the per-request timeout parameter instead.
+            # Disable low-speed limit (default 30s < 1byte/s) to avoid premature
+            # timeout on slow upstream responses. The upstream timeout is handled
+            # by the per-request timeout parameter instead.
+            kwargs["curl_options"] = {48: 0}  # LOW_SPEED_TIME=0 disables low-speed limit
             _session_pool[endpoint] = SessionType(**kwargs)
         return _session_pool[endpoint]
 
@@ -328,6 +394,7 @@ def create_fresh_session(is_stream: bool):
     if not ENABLE_HTTP2:
         from curl_cffi import CurlHttpVersion
         kwargs["http_version"] = CurlHttpVersion.V1_1
+    kwargs["curl_options"] = {48: 0}  # LOW_SPEED_TIME=0 disables low-speed limit
     return SessionType(**kwargs)
 
 def _close_all_sessions():
@@ -517,7 +584,7 @@ TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
 MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "4"))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 UPSTREAM_RPM = float(os.environ.get("UPSTREAM_RPM", "10"))
-MAX_UPSTREAM_CONCURRENCY = max(1, int(os.environ.get("MAX_UPSTREAM_CONCURRENCY", "1")))
+MAX_UPSTREAM_CONCURRENCY = max(1, int(os.environ.get("MAX_UPSTREAM_CONCURRENCY", "20")))
 RATE_LIMIT_ROTATION_THRESHOLD = max(1, int(os.environ.get("RATE_LIMIT_ROTATION_THRESHOLD", "2")))
 MAX_RATE_LIMIT_WAIT = max(0.0, float(os.environ.get("MAX_RATE_LIMIT_WAIT", "8")))
 NETWORK_FAILURE_ROTATION_THRESHOLD = max(1, int(os.environ.get("NETWORK_FAILURE_ROTATION_THRESHOLD", "2")))
@@ -546,21 +613,24 @@ metrics = {
 }
 
 DEFAULT_FREE_MODELS = [
-    {"id": "deepseek-v4-flash-free", "name": "DeepSeek V4 Flash Free"},
     {"id": "mimo-v2.5-free", "name": "MiMo V2.5 Free"},
+    {"id": "ling-3.0-flash-fin-free", "name": "Ling 3.0 Flash Fin Free"},
     {"id": "nemotron-3-ultra-free", "name": "Nemotron 3 Ultra Free"},
     {"id": "nemotron-3.5-lightning-free", "name": "Nemotron 3.5 Lightning Free"},
-    {"id": "laguna-s-2.1-free", "name": "Laguna S 2.1 Free"},
-    {"id": "hy3-free", "name": "HY3 Free"},
+    {"id": "muse-spark-1.3-contributor-free", "name": "Muse Spark 1.3 Contributor Free"},
     {"id": "muse-spark-1.2-contributor-free", "name": "Muse Spark 1.2 Contributor Free"},
 ]
 
 # 默认请求模型（可通过 DEFAULT_MODEL 覆盖）。上游 /models 返回的真实 free 模型会
 # 在自动发现后整体替换 DEFAULT_FREE_MODELS；此处仅作为发现失败时的兜底默认值。
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek-v4-flash-free")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "mimo-v2.5-free")
 
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
+
+# 按客户端标识缓存 x-opencode-session，同一客户端复用同一 session
+_session_cache: Dict[str, str] = {}
+_session_cache_lock = threading.Lock()
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -627,6 +697,10 @@ async def serialize_upstream_requests(request: Request, call_next):
         try:
             async for chunk in original_iterator:
                 yield chunk
+                # Detect client disconnect early to release semaphore
+                if await request.is_disconnected():
+                    log.warning("[STREAM DEBUG] Client disconnected mid-stream; releasing semaphore early.")
+                    break
         finally:
             _upstream_request_semaphore.release()
 
@@ -645,9 +719,10 @@ def discover_models_task():
     global discovered_models
     while not _discovery_stop.is_set():
         try:
+            disc_headers = get_realistic_headers()
             req = UrlRequest(
                 f"{TARGET_ZEN_BASE}/models",
-                headers={"Authorization": "Bearer public", "User-Agent": "Mozilla/5.0"}
+                headers=disc_headers
             )
             with urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -660,10 +735,14 @@ def discover_models_task():
                             new_models.append({"id": m_id, "name": m_id.replace("-", " ").title()})
                     
                     if new_models:
-                        with _discovery_lock:
-                            discovered_models = new_models
-                            metrics["discovered_models_count"] = len(discovered_models)
-                        log.info(f"Auto-Discovery refreshed: {len(discovered_models)} active model(s) fetched.")
+                        # 过滤掉已知不可用的模型
+                        unavailable = {"deepseek-v4-flash-free", "hy3-free", "laguna-s-2.1-free"}
+                        new_models = [m for m in new_models if m["id"] not in unavailable]
+                        if new_models:
+                            with _discovery_lock:
+                                discovered_models = new_models
+                                metrics["discovered_models_count"] = len(discovered_models)
+                            log.info(f"Auto-Discovery refreshed: {len(discovered_models)} active model(s) fetched.")
         except Exception as e:
             log.debug(f"Auto-Discovery fallback active: {e}")
         _discovery_stop.wait(300)
@@ -724,12 +803,20 @@ def normalize_anthropic_request(body: dict) -> dict:
         normalized["system"] = [{"type": "text", "text": system}]
     return normalized
 
-def get_realistic_headers() -> Dict[str, str]:
+def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
+    if client_key:
+        with _session_cache_lock:
+            if client_key not in _session_cache:
+                _session_cache[client_key] = f"dsh-opencode-go-session-{uuid.uuid4().hex[:12]}"
+            session = _session_cache[client_key]
+    else:
+        session = os.environ.get("OPENCODE_SESSION", "dsh-opencode-go-session")
     return {
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
         "Accept": "application/json, text/event-stream, */*",
         "User-Agent": "OpenCode-IP-Rotator/1.0",
+        "x-opencode-session": session,
     }
 
 
@@ -1457,6 +1544,30 @@ async def panel_remove_proxy(addr: str):
     load_proxy_list()
     return result
 
+@app.get("/api/panel/history")
+def api_request_history(limit: int = 100):
+    """Return recent request history records."""
+    try:
+        rows = _db_fetchall(
+            "SELECT id, timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream, attempt, error_msg "
+            "FROM request_history ORDER BY id DESC LIMIT ?",
+            (min(limit, 500),),
+        )
+        result = []
+        for row in rows:
+            if hasattr(row, 'keys'):
+                result.append(dict(row))
+            else:
+                result.append({
+                    "id": row[0], "timestamp": row[1], "model": row[2],
+                    "proxy_ip": row[3], "egress_ip": row[4], "latency_ms": row[5],
+                    "status": row[6], "is_stream": row[7], "attempt": row[8], "error_msg": row[9],
+                })
+        return {"ok": True, "history": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/panel/proxies/check")
 async def panel_check_proxies(body: CheckProxiesBody):
     result = await asyncio.to_thread(panel_mgr.check_proxies, body.addrs)
@@ -1606,7 +1717,8 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
-    headers = get_realistic_headers()
+    client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
+    headers = get_realistic_headers(client_key)
     for k, v in raw_request.headers.items():
         if k.lower().startswith("x-opencode-"):
             headers[k] = v
@@ -1627,7 +1739,7 @@ async def chat_completions(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120
+                timeout=MODEL_TIMEOUT_OVERRIDES.get(current_model, STREAM_TIMEOUT) if is_stream else 120
             )
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
             if response.status_code == 429:
@@ -1652,6 +1764,15 @@ async def chat_completions(raw_request: Request):
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
+            record_request_history(
+                model=current_model,
+                proxy_ip=_request_proxy_url(proxies) or "",
+                egress_ip=egress_key,
+                latency_ms=round((time.time() - start_time) * 1000, 1),
+                status="ok",
+                is_stream=is_stream,
+                attempt=attempt,
+            )
 
             if is_stream:
                 try:
@@ -1661,6 +1782,15 @@ async def chat_completions(raw_request: Request):
                     prom_requests_success.labels(model=current_model).inc()
                     prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                    record_request_history(
+                        model=current_model,
+                        proxy_ip=_request_proxy_url(proxies) or "",
+                        egress_ip=egress_key,
+                        latency_ms=round((time.time() - start_time) * 1000, 1),
+                        status="ok",
+                        is_stream=is_stream,
+                        attempt=attempt,
+                    )
                     return StreamingResponse(
                         stream_gen,
                         media_type="text/event-stream",
@@ -1711,6 +1841,16 @@ async def chat_completions(raw_request: Request):
             continue
 
     log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}'. Returning 503.")
+    record_request_history(
+        model=current_model,
+        proxy_ip=_request_proxy_url(proxies) if proxies else "",
+        egress_ip=egress_key,
+        latency_ms=round((time.time() - start_time) * 1000, 1),
+        status="failed",
+        is_stream=is_stream,
+        attempt=MAX_RETRIES_ON_429,
+        error_msg="All attempts exhausted",
+    )
     return JSONResponse(
         status_code=503,
         content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
@@ -1743,7 +1883,7 @@ async def anthropic_messages(raw_request: Request):
         if auth.startswith("Bearer "):
             client_api_key = auth[7:]
 
-    headers = get_realistic_headers()
+    headers = get_realistic_headers(client_api_key)
     headers["x-api-key"] = client_api_key or "public"
 
     for k, v in raw_request.headers.items():
@@ -1767,7 +1907,7 @@ async def anthropic_messages(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
+                timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT) if is_stream else 120,
             )
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
@@ -1856,7 +1996,8 @@ async def responses_endpoint(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
 
-    headers = get_realistic_headers()
+    client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
+    headers = get_realistic_headers(client_key)
     for k, v in raw_request.headers.items():
         if k.lower().startswith("x-opencode-"):
             headers[k] = v
@@ -1877,7 +2018,7 @@ async def responses_endpoint(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
+                timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT) if is_stream else 120,
             )
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
             if response.status_code == 429:

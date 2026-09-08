@@ -19,6 +19,7 @@ PROXY_STATE_FILE = Path(os.environ.get("PROXY_STATE_FILE", "/app/data/proxy_stat
 EGRESS_STATE_FILE = Path(os.environ.get("EGRESS_STATE_FILE", "/app/data/egress_state.json"))
 PROXY_COOLDOWN_BASE = int(os.environ.get("PROXY_COOLDOWN_BASE", "60"))
 PROXY_COOLDOWN_FACTOR = int(os.environ.get("PROXY_COOLDOWN_FACTOR", "30"))
+PROXY_LATENCY_THRESHOLD_MS = int(os.environ.get("PROXY_LATENCY_THRESHOLD_MS", "300"))
 
 
 def read_proxy_list() -> List[str]:
@@ -151,6 +152,19 @@ def set_mihomo_active(
     return write_egress_state(state)
 
 
+def _proxy_latency_ok(entry: Dict[str, Any]) -> bool:
+    """Return True if the proxy's latency is within acceptable range."""
+    if not isinstance(entry, dict):
+        return True
+    try:
+        latency = entry.get("latency")
+        if latency is None:
+            return True  # No latency data yet, allow it
+        return float(latency) <= PROXY_LATENCY_THRESHOLD_MS
+    except (TypeError, ValueError):
+        return True
+
+
 def select_active_proxy(proxies: Optional[Iterable[str]] = None) -> Optional[str]:
     values = list(proxies) if proxies is not None else read_proxy_list()
     values = [normalize_proxy_url(value) for value in values if value]
@@ -160,6 +174,11 @@ def select_active_proxy(proxies: Optional[Iterable[str]] = None) -> Optional[str
     state = read_proxy_state()
     now = time.time()
     available = [value for value in values if is_proxy_eligible(value, state, now)]
+    # Filter out high-latency proxies (keep low-latency ones for better performance)
+    if available:
+        low_latency = [p for p in available if _proxy_latency_ok(state.get(p, {}))]
+        if low_latency:
+            available = low_latency
     if not available:
         return None
     route = read_egress_state()

@@ -8,18 +8,10 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    fontFamily: {
-                        sans: ['Inter', 'sans-serif'],
-                        mono: ['JetBrains Mono', 'monospace'],
-                    }
-                }
-            }
-        }
-    </script>
+    <!-- ============ Tab: 请求历史 ============ -->
+
+
+
 </head>
 <body class="h-full text-slate-900 font-sans antialiased selection:bg-slate-900 selection:text-white">
     <header class="bg-white/80 backdrop-blur-md border-b border-slate-200/80 sticky top-0 z-50">
@@ -46,6 +38,7 @@
             <button onclick="switchTab('groups')" data-tab="groups" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">节点组</button>
             <button onclick="switchTab('test')" data-tab="test" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">模型测试</button>
             <button onclick="switchTab('proxy')" data-tab="proxy" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">代理池</button>
+            <button onclick="switchTab('history')" data-tab="history" class="tab-btn px-4 py-2.5 text-xs font-medium text-slate-500 hover:text-slate-800 border-b-2 border-transparent transition-colors">请求历史</button>
         </nav>
     </header>
 
@@ -399,6 +392,48 @@
                     </thead>
                     <tbody id="proxy-table-body" class="divide-y divide-slate-100 text-slate-700">
                         <tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无代理，请在上方添加。</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ Tab: 请求历史 ============ -->
+    <section id="tab-history" class="tab-panel hidden max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <div class="flex items-start justify-between">
+            <div>
+                <p class="text-sm font-semibold text-slate-900">请求历史</p>
+                <p class="text-xs text-slate-400 mt-0.5">记录每次模型请求的时间、代理IP、响应耗时</p>
+            </div>
+            <div class="flex items-center gap-2">
+                <select id="history-limit" onchange="loadHistory()" class="text-xs border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-300">
+                    <option value="50">最近 50 条</option>
+                    <option value="100" selected>最近 100 条</option>
+                    <option value="200">最近 200 条</option>
+                    <option value="500">最近 500 条</option>
+                </select>
+                <button onclick="loadHistory()" class="inline-flex items-center gap-1.5 bg-white border border-slate-200 text-slate-700 text-xs font-medium h-8 px-3.5 rounded-md transition-all hover:bg-slate-50 active:scale-95">刷新</button>
+            </div>
+        </div>
+
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr>
+                            <th class="px-4 py-2.5">时间</th>
+                            <th class="px-4 py-2.5">模型</th>
+                            <th class="px-4 py-2.5">代理IP</th>
+                            <th class="px-4 py-2.5">出口标识</th>
+                            <th class="px-4 py-2.5 text-right">耗时</th>
+                            <th class="px-4 py-2.5">状态</th>
+                            <th class="px-4 py-2.5">流式</th>
+                            <th class="px-4 py-2.5">重试</th>
+                            <th class="px-4 py-2.5">错误</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-table-body" class="divide-y divide-slate-100 text-slate-700">
+                        <tr><td colspan="9" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">加载中...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1425,6 +1460,54 @@
         fetchMetrics();
         switchTab('overview');
         loadProxyRouteStatus();
-    </script>
+    
+    // ---- Request History ----
+    async function loadHistory() {
+        const limit = document.getElementById('history-limit')?.value || 100;
+        try {
+            const resp = await fetch(`/api/panel/history?limit=${limit}`);
+            const data = await resp.json();
+            const tbody = document.getElementById('history-table-body');
+            if (!data.ok || !data.history || data.history.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录</td></tr>';
+                return;
+            }
+            tbody.innerHTML = data.history.map(r => {
+                const statusBadge = r.status === 'ok'
+                    ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-green-50 text-green-700 border border-green-200">成功</span>'
+                    : '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-red-50 text-red-700 border border-red-200">失败</span>';
+                const streamBadge = r.is_stream
+                    ? '<span class="text-slate-500">是</span>'
+                    : '<span class="text-slate-300">否</span>';
+                const latency = r.latency_ms != null ? (r.latency_ms >= 1000 ? (r.latency_ms/1000).toFixed(1)+'s' : r.latency_ms.toFixed(0)+'ms') : '-';
+                const latencyColor = r.latency_ms != null
+                    ? (r.latency_ms < 500 ? 'text-green-600' : r.latency_ms < 2000 ? 'text-yellow-600' : 'text-red-600')
+                    : 'text-slate-400';
+                const proxyShort = r.proxy_ip ? r.proxy_ip.replace('socks5h://','').replace('socks5://','').replace('http://','').replace('https://','') : '-';
+                const egressShort = r.egress_ip && r.egress_ip !== 'unknown' ? r.egress_ip : '-';
+                return `<tr class="hover:bg-slate-50/50">
+                    <td class="px-4 py-2.5 font-mono text-[11px] text-slate-500 whitespace-nowrap">${r.timestamp || '-'}</td>
+                    <td class="px-4 py-2.5 font-mono text-[11px] text-slate-800">${r.model || '-'}</td>
+                    <td class="px-4 py-2.5 font-mono text-[11px] text-slate-600" title="${r.proxy_ip || ''}">${proxyShort}</td>
+                    <td class="px-4 py-2.5 font-mono text-[11px] text-slate-600" title="${r.egress_ip || ''}">${egressShort}</td>
+                    <td class="px-4 py-2.5 font-mono text-[11px] ${latencyColor} text-right whitespace-nowrap">${latency}</td>
+                    <td class="px-4 py-2.5">${statusBadge}</td>
+                    <td class="px-4 py-2.5 text-[11px]">${streamBadge}</td>
+                    <td class="px-4 py-2.5 font-mono text-[11px] text-slate-500 text-center">${r.attempt || 1}</td>
+                    <td class="px-4 py-2.5 font-mono text-[11px] text-red-500 max-w-[120px] truncate" title="${r.error_msg || ''}">${r.error_msg || '-'}</td>
+                </tr>`;
+            }).join('');
+        } catch (e) {
+            console.error('Failed to load history:', e);
+        }
+    }
+
+    // Auto-load history when switching to history tab
+    const origSwitchTab = switchTab;
+    switchTab = function(tab) {
+        origSwitchTab(tab);
+        if (tab === 'history') loadHistory();
+    };
+</script>
 </body>
 </html>
