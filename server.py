@@ -108,6 +108,7 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
 
     If session_key is provided, the proxy is cached per-session so that all
     requests in the same conversation share the same egress.
+    New sessions are assigned to idle (unbound) proxies when available.
     """
     custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
     route = proxy_pool.routing_snapshot()
@@ -131,9 +132,29 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
             return {"http": custom_proxy, "https": custom_proxy}
         return None
 
+    # 为新 session 选代理：优先选空闲（未被其他 session 绑定）的代理
+    if session_key:
+        with _session_proxy_map_lock:
+            bound_proxies = set(_session_proxy_map.values())
+        all_eligible = proxy_pool.eligible_proxies()
+        if all_eligible:
+            # 空闲代理 = 可用但未被任何 session 绑定的
+            free_proxies = [p for p in all_eligible if p not in bound_proxies]
+            log.info(f"Session {session_key[:20]}... proxy selection: {len(all_eligible)} eligible, {len(bound_proxies)} bound, {len(free_proxies)} free")
+            if free_proxies:
+                proxy_url = proxy_pool.select_active_proxy(free_proxies)
+                log.info(f"Session {session_key[:20]}... selected free proxy: {proxy_url}")
+            else:
+                # 所有可用代理都被绑定了，选一个负载最少的
+                proxy_url = proxy_pool.select_active_proxy(all_eligible)
+                log.info(f"Session {session_key[:20]}... all proxies bound, selected: {proxy_url}")
+            if proxy_url:
+                with _session_proxy_map_lock:
+                    _session_proxy_map[session_key] = proxy_url
+                return {"http": proxy_url, "https": proxy_url}
+
     proxy_url = proxy_pool.select_active_proxy(_proxy_pool)
     if proxy_url:
-        # 绑定 session
         if session_key:
             with _session_proxy_map_lock:
                 _session_proxy_map[session_key] = proxy_url
@@ -2119,13 +2140,16 @@ async def anthropic_messages(raw_request: Request):
         if kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
             headers[k] = v
 
+    # 会话标识：优先用客户端传入的 x-opencode-session
+    session_key = headers.get("x-opencode-session", "") or client_api_key
+
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         proxies = None
         egress_key = "unknown"
         try:
-            proxies = get_next_outbound_proxy()
+            proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
             session = create_fresh_session(is_stream) if is_stream else _get_session("anthropic")
             response = session.post(
@@ -2234,13 +2258,16 @@ async def responses_endpoint(raw_request: Request):
         if k.lower().startswith("x-opencode-"):
             headers[k] = v
 
+    # 会话标识：优先用客户端传入的 x-opencode-session
+    session_key = headers.get("x-opencode-session", "") or client_key
+
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         proxies = None
         egress_key = "unknown"
         try:
-            proxies = get_next_outbound_proxy()
+            proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
             session = create_fresh_session(is_stream) if is_stream else _get_session("responses")
             response = session.post(
