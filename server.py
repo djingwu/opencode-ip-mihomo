@@ -686,12 +686,57 @@ def _convert_messages_to_input(messages: list) -> list:
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
+        if role == "tool":
+            output = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            result.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id") or msg.get("call_id") or msg.get("id") or "call_unknown",
+                "output": output,
+            })
+            continue
+        tool_calls = msg.get("tool_calls")
+        if role == "assistant" and isinstance(tool_calls, list):
+            if content:
+                text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                result.append({
+                    "role": role,
+                    "content": [{"type": "output_text", "text": text}],
+                })
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                fn = tool_call.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name") or tool_call.get("name")
+                if not name:
+                    continue
+                arguments = fn.get("arguments", "")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                result.append({
+                    "type": "function_call",
+                    "call_id": tool_call.get("id") or tool_call.get("call_id") or f"call_{uuid.uuid4().hex[:20]}",
+                    "name": name,
+                    "arguments": arguments,
+                })
+            continue
+        if content is None:
+            continue
+        text_type = "output_text" if role == "assistant" else "input_text"
         if isinstance(content, str):
             result.append({
                 "role": role,
-                "content": [{"type": "input_text", "text": content}]
+                "content": [{"type": text_type, "text": content}]
             })
         elif isinstance(content, list):
+            if role == "assistant":
+                content = [
+                    {**item, "type": "output_text"}
+                    if isinstance(item, dict) and item.get("type") == "input_text"
+                    else item
+                    for item in content
+                ]
             result.append({
                 "role": role,
                 "content": content
