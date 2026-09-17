@@ -797,6 +797,7 @@ async def responses_stream_as_chat(response, model_name: str):
     full_text = ""
     finish_reason = "stop"
     usage = {}
+    tool_call_state = {}
 
     def make_chunk(delta: dict, finish: str = None) -> bytes:
         chunk = {
@@ -860,8 +861,38 @@ async def responses_stream_as_chat(response, model_name: str):
             incomplete = resp_data.get("incomplete_details") or {}
             if status == "incomplete" and incomplete.get("reason") == "max_output_tokens":
                 finish_reason = "length"
+        elif event_type == "response.output_item.added":
+            item = data.get("item") or {}
+            if item.get("type") == "function_call":
+                output_index = data.get("output_index", 0)
+                key = item.get("id") or output_index
+                tool_call_state[key] = {
+                    "index": output_index,
+                    "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:20]}",
+                    "name": item.get("name") or "tool",
+                }
         elif event_type == "response.function_call_arguments.delta":
-            yield make_chunk({"tool_calls": [{"function": {"arguments": data.get("delta", "")}}]})
+            output_index = data.get("output_index", 0)
+            key = data.get("item_id") or output_index
+            state = tool_call_state.get(key) or tool_call_state.get(output_index)
+            if not state:
+                state = {
+                    "index": output_index,
+                    "id": data.get("call_id") or data.get("item_id") or f"call_{uuid.uuid4().hex[:20]}",
+                    "name": data.get("name") or "tool",
+                }
+                tool_call_state[key] = state
+            yield make_chunk({
+                "tool_calls": [{
+                    "index": state["index"],
+                    "id": state["id"],
+                    "type": "function",
+                    "function": {
+                        "name": state["name"],
+                        "arguments": data.get("delta", ""),
+                    },
+                }]
+            })
         elif event_type == "error":
             break
 
