@@ -657,6 +657,134 @@ def _convert_messages_to_input(messages: list) -> list:
             result.append(msg)
     return result
 
+
+async def responses_stream_as_chat(response, model_name: str):
+    """将 Responses API 的流式 SSE 事件转为 Chat Completions SSE 格式。"""
+    loop = asyncio.get_event_loop()
+    pending_sse_event = ""
+    message_id = f"chatcmpl-{uuid.uuid4().hex[:20]}"
+    created = int(time.time())
+    reasoning_text = ""
+    full_text = ""
+    finish_reason = "stop"
+    usage = {}
+
+    def make_chunk(delta: dict, finish: str = None) -> bytes:
+        chunk = {
+            "id": message_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish,
+            }]
+        }
+        return b"data: " + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"
+
+    # 先发 role chunk
+    yield make_chunk({"role": "assistant", "content": ""})
+
+    line_iter = response.iter_lines()
+    while True:
+        try:
+            item = await loop.run_in_executor(None, next, line_iter)
+        except StopIteration:
+            break
+        except Exception:
+            break
+        if not item:
+            yield b"\n"
+            continue
+
+        raw = item.decode("utf-8", errors="ignore").strip()
+        if raw.startswith("event:"):
+            pending_sse_event = raw[6:].strip()
+            continue
+        if not raw.startswith("data:"):
+            continue
+
+        pending_sse_event = ""
+        try:
+            data = json.loads(raw[5:])
+        except json.JSONDecodeError:
+            continue
+
+        event_type = data.get("type", "")
+        if event_type == "response.output_text.delta":
+            delta_text = data.get("delta", "")
+            full_text += delta_text
+            yield make_chunk({"content": delta_text})
+        elif event_type == "response.output_text.done":
+            pass  # 内容已通过 delta 发送
+        elif event_type == "response.completed":
+            resp_data = data.get("response") or {}
+            usage = resp_data.get("usage", {})
+            status = resp_data.get("status", "completed")
+            incomplete = resp_data.get("incomplete_details") or {}
+            if status == "incomplete" and incomplete.get("reason") == "max_output_tokens":
+                finish_reason = "length"
+        elif event_type == "response.function_call_arguments.delta":
+            yield make_chunk({"tool_calls": [{"function": {"arguments": data.get("delta", "")}}]})
+        elif event_type == "error":
+            break
+
+    # 发 finish chunk
+    yield make_chunk({}, finish_reason)
+    yield b"data: [DONE]\n\n"
+
+    # 更新 token usage
+    if usage:
+        track_token_usage(
+            model_name,
+            prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
+            completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+        )
+
+
+def _convert_responses_to_chat(resp: dict, model_name: str) -> dict:
+    """将 Responses API 响应格式转为 Chat Completions 格式。
+    Responses: {"object":"response","output":[{"type":"reasoning","encrypted_content":"..."},{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}
+    Chat: {"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi","reasoning":"..."},"finish_reason":"stop"}]}
+    """
+    output = resp.get("output", [])
+    reasoning_text = ""
+    message_text = ""
+    for item in output:
+        if item.get("type") == "reasoning":
+            reasoning_text = item.get("encrypted_content", "") or ""
+        elif item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text":
+                    message_text = c.get("text", "")
+
+    status = resp.get("status", "completed")
+    incomplete = resp.get("incomplete_details") or {}
+    if status == "incomplete":
+        reason = incomplete.get("reason", "")
+        finish_reason = "length" if reason == "max_output_tokens" else "stop"
+    else:
+        finish_reason = "stop"
+
+    message = {"role": "assistant", "content": message_text}
+    if reasoning_text:
+        message["reasoning"] = reasoning_text
+
+    return {
+        "id": resp.get("id", ""),
+        "object": "chat.completion",
+        "created": resp.get("created_at", int(time.time())),
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": resp.get("usage", {}),
+    }
+
+
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
@@ -1838,7 +1966,10 @@ async def chat_completions(raw_request: Request):
             if is_stream:
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
-                    stream_gen = stream_response(response, current_model, session=session)
+                    if current_model in RESPONSES_ONLY_MODELS:
+                        stream_gen = responses_stream_as_chat(response, current_model)
+                    else:
+                        stream_gen = stream_response(response, current_model, session=session)
                     metrics["successful_requests"] += 1
                     prom_requests_success.labels(model=current_model).inc()
                     prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
@@ -1866,6 +1997,9 @@ async def chat_completions(raw_request: Request):
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
+                        # Responses-only 模型：将 Responses API 响应转为 Chat Completions 格式
+                        if current_model in RESPONSES_ONLY_MODELS:
+                            res_json = _convert_responses_to_chat(res_json, current_model)
                         usage = res_json.get("usage", {})
                         track_token_usage(
                             current_model,
