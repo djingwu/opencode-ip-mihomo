@@ -99,15 +99,33 @@ def load_proxy_list():
     if _proxy_pool:
         log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
 
-def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
+def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
     """Return the current unified egress.
 
     A manual rotation can temporarily hold the route on mihomo while it walks
     through ROTATOR nodes. In that state do not immediately re-select a custom
     proxy on the next model request.
+
+    If session_key is provided, the proxy is cached per-session so that all
+    requests in the same conversation share the same egress.
     """
     custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
     route = proxy_pool.routing_snapshot()
+
+    # session 绑定：同一会话复用同一代理
+    if session_key:
+        with _session_proxy_map_lock:
+            bound_proxy = _session_proxy_map.get(session_key)
+        if bound_proxy:
+            # 检查绑定的代理是否仍可用
+            if proxy_pool.is_proxy_eligible(bound_proxy):
+                return {"http": bound_proxy, "https": bound_proxy}
+            else:
+                # 代理不可用，清除绑定
+                with _session_proxy_map_lock:
+                    _session_proxy_map.pop(session_key, None)
+                log.info(f"Session {session_key[:20]}... bound proxy {bound_proxy} unavailable; will reselect.")
+
     if route.get("mode") == "mihomo" and route.get("hold_mihomo") is True:
         if custom_proxy:
             return {"http": custom_proxy, "https": custom_proxy}
@@ -115,6 +133,10 @@ def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
 
     proxy_url = proxy_pool.select_active_proxy(_proxy_pool)
     if proxy_url:
+        # 绑定 session
+        if session_key:
+            with _session_proxy_map_lock:
+                _session_proxy_map[session_key] = proxy_url
         return {"http": proxy_url, "https": proxy_url}
     if custom_proxy:
         if route.get("mode") != "mihomo":
@@ -791,6 +813,10 @@ _discovery_lock = threading.Lock()
 # 按客户端标识缓存 x-opencode-session，同一客户端复用同一 session
 _session_cache: Dict[str, str] = {}
 _session_cache_lock = threading.Lock()
+
+# session → proxy 绑定：不同会话使用不同代理出口
+_session_proxy_map: Dict[str, str] = {}
+_session_proxy_map_lock = threading.Lock()
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -1912,13 +1938,16 @@ async def chat_completions(raw_request: Request):
         if k.lower().startswith("x-opencode-"):
             headers[k] = v
 
+    # 会话标识：优先用客户端传入的 x-opencode-session，否则用 client_key
+    session_key = headers.get("x-opencode-session", "") or client_key
+
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         proxies = None
         egress_key = "unknown"
         try:
-            proxies = get_next_outbound_proxy()
+            proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
             session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
             response = session.post(
@@ -2022,6 +2051,10 @@ async def chat_completions(raw_request: Request):
             transport_error = is_egress_transport_error(e)
             if transport_error:
                 _mark_request_proxy_failure(proxies)
+            # 代理失败时清除 session 绑定，下次请求重新选代理
+            if session_key:
+                with _session_proxy_map_lock:
+                    _session_proxy_map.pop(session_key, None)
             _reset_request_session("chat", session, pooled=not is_stream)
             consecutive_timeouts = consecutive_timeouts + 1 if transport_error else 0
             if consecutive_timeouts >= NETWORK_FAILURE_ROTATION_THRESHOLD and ROTATE_ON_429:
@@ -2155,6 +2188,10 @@ async def anthropic_messages(raw_request: Request):
             transport_error = is_egress_transport_error(e)
             if transport_error:
                 _mark_request_proxy_failure(proxies)
+            # 代理失败时清除 session 绑定，下次请求重新选代理
+            if session_key:
+                with _session_proxy_map_lock:
+                    _session_proxy_map.pop(session_key, None)
             _reset_request_session("anthropic", session, pooled=not is_stream)
             consecutive_timeouts = consecutive_timeouts + 1 if transport_error else 0
             if consecutive_timeouts >= NETWORK_FAILURE_ROTATION_THRESHOLD and ROTATE_ON_429:
@@ -2258,6 +2295,10 @@ async def responses_endpoint(raw_request: Request):
             transport_error = is_egress_transport_error(e)
             if transport_error:
                 _mark_request_proxy_failure(proxies)
+            # 代理失败时清除 session 绑定，下次请求重新选代理
+            if session_key:
+                with _session_proxy_map_lock:
+                    _session_proxy_map.pop(session_key, None)
             _reset_request_session("responses", session, pooled=not is_stream)
             consecutive_timeouts = consecutive_timeouts + 1 if transport_error else 0
             if consecutive_timeouts >= NETWORK_FAILURE_ROTATION_THRESHOLD and ROTATE_ON_429:
