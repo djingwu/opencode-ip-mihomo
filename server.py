@@ -729,13 +729,19 @@ async def responses_stream_as_chat(response, model_name: str):
     # 先发 role chunk
     yield make_chunk({"role": "assistant", "content": ""})
 
+    def get_next_line(iter_lines):
+        try:
+            return next(iter_lines)
+        except StopIteration:
+            return None
+        except Exception as exc:
+            log.error("[responses_stream_as_chat] iter_lines error: %s: %s", type(exc).__name__, exc)
+            return None
+
     line_iter = response.iter_lines()
     while True:
-        try:
-            item = await loop.run_in_executor(None, next, line_iter)
-        except StopIteration:
-            break
-        except Exception:
+        item = await loop.run_in_executor(None, get_next_line, line_iter)
+        if item is None:
             break
         if not item:
             yield b"\n"
