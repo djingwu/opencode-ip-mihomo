@@ -701,6 +701,47 @@ def _convert_messages_to_input(messages: list) -> list:
     return result
 
 
+def _convert_tools_to_responses_format(tools: list) -> list:
+    """将 Chat Completions tools 格式转为 Responses API tools 格式。
+    Chat: [{"type":"function","function":{"name":"get_weather","description":"...","parameters":{...}}}]
+    Responses: [{"type":"function","name":"get_weather","description":"...","parameters":{...}}]
+    """
+    result = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            result.append(tool)
+            continue
+        t = dict(tool)
+        if t.get("type") == "function" and "function" in t:
+            fn = t.pop("function")
+            if isinstance(fn, dict):
+                t["name"] = fn.get("name", "")
+                if "description" in fn:
+                    t["description"] = fn["description"]
+                if "parameters" in fn:
+                    t["parameters"] = fn["parameters"]
+                if "strict" in fn:
+                    t["strict"] = fn["strict"]
+        if t.get("type") == "function" and not t.get("name"):
+            continue
+        result.append(t)
+    return result
+
+
+def _convert_tool_choice_to_responses_format(tool_choice):
+    """将 Chat Completions tool_choice 格式转为 Responses API 格式。
+    上游仅支持字符串 "auto"，所有其他值均回退为 auto 或移除。
+    """
+    if isinstance(tool_choice, str):
+        return "auto" if tool_choice != "none" else None
+    if not isinstance(tool_choice, dict):
+        return "auto"
+    tc_type = tool_choice.get("type", "")
+    if tc_type == "none":
+        return None
+    return "auto"
+
+
 async def responses_stream_as_chat(response, model_name: str):
     """将 Responses API 的流式 SSE 事件转为 Chat Completions SSE 格式。"""
     loop = asyncio.get_event_loop()
@@ -1957,6 +1998,19 @@ async def chat_completions(raw_request: Request):
             payload["input"] = _convert_messages_to_input(payload.pop("messages"))
         if "max_tokens" in payload:
             payload["max_output_tokens"] = payload.pop("max_tokens")
+        # 转换 tools 格式（Chat Completions → Responses API）
+        if "tools" in payload:
+            payload["tools"] = _convert_tools_to_responses_format(payload["tools"])
+        # 转换 tool_choice 格式（Chat Completions → Responses API）
+        if "tool_choice" in payload:
+            converted_tc = _convert_tool_choice_to_responses_format(payload["tool_choice"])
+            if converted_tc is None:
+                payload.pop("tool_choice", None)
+            else:
+                payload["tool_choice"] = converted_tc
+        # 移除 Responses API 不支持的 Chat Completions 参数
+        for key in ("reasoning_effort", "n", "frequency_penalty", "presence_penalty", "stop", "user"):
+            payload.pop(key, None)
         _target_url = TARGET_ZEN_RESPONSES_URL
 
     client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
