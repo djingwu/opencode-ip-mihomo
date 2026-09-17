@@ -2134,6 +2134,50 @@ async def chat_completions(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            # 处理 400/403 等客户端错误——上游拒绝了请求，不应标记成功
+            if response.status_code >= 400:
+                log.warning("Upstream HTTP %s for '%s'; returning error to client.", response.status_code, current_model)
+                if is_stream:
+                    # 流式请求：读取错误响应体，返回 SSE 格式的错误
+                    try:
+                        error_lines = [line.decode("utf-8", errors="ignore").strip() for line in response.iter_lines() if line]
+                        error_body = "".join(error_lines) if error_lines else "Unknown upstream error"
+                    except Exception:
+                        error_body = "Unknown upstream error"
+                    log.warning("Upstream error body for '%s': %s", current_model, error_body[:500])
+                    error_chunk = {
+                        "id": f"chatcmpl-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": current_model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"[Upstream {response.status_code}] {error_body}"}, "finish_reason": "stop"}]
+                    }
+                    error_sse = f"data: {json.dumps(error_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    return StreamingResponse(
+                        [error_sse, "data: [DONE]\n\n"],
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+                    )
+                else:
+                    # 非流式请求：直接返回上游的错误响应
+                    try:
+                        error_body = response.json()
+                    except Exception:
+                        error_body = {"error": {"message": response.text[:500] if response.text else "Unknown upstream error", "type": "upstream_error"}}
+                    log.warning("Upstream error body for '%s': %s", current_model, str(error_body)[:500])
+                    return JSONResponse(
+                        content={
+                            "id": f"chatcmpl-{int(time.time())}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": current_model,
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": f"[Upstream {response.status_code}] {json.dumps(error_body, ensure_ascii=False)}"}, "finish_reason": "stop"}]
+                        },
+                        status_code=200
+                    )
+
+            if current_model in RESPONSES_ONLY_MODELS:
+                log.info(f"Upstream response for '{current_model}': status={response.status_code}")
             _mark_request_proxy_success(proxies)
             _egress_rate_policy.record_success(egress_key)
             metrics["successful_requests"] += 1
