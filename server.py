@@ -626,6 +626,37 @@ DEFAULT_FREE_MODELS = [
 # 在自动发现后整体替换 DEFAULT_FREE_MODELS；此处仅作为发现失败时的兜底默认值。
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "mimo-v2.5-free")
 
+# 仅支持 Responses API 的模型（走 /v1/responses 而非 /v1/chat/completions）
+RESPONSES_ONLY_MODELS = {
+    "muse-spark-1.3-contributor-free",
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2-contributor",
+}
+
+def _convert_messages_to_input(messages: list) -> list:
+    """将 Chat Completions messages 格式转为 Responses API input 格式。
+    Chat: [{"role":"user","content":"hi"}]
+    Responses: [{"role":"user","content":[{"type":"input_text","text":"hi"}]}]
+    """
+    result = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            result.append({
+                "role": role,
+                "content": [{"type": "input_text", "text": content}]
+            })
+        elif isinstance(content, list):
+            result.append({
+                "role": role,
+                "content": content
+            })
+        else:
+            result.append(msg)
+    return result
+
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
@@ -1737,6 +1768,16 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
+    # Responses-only 模型：转换 body 格式并切换目标 URL
+    _target_url = TARGET_ZEN_URL
+    if current_model in RESPONSES_ONLY_MODELS:
+        log.info(f"Model '{current_model}' is responses-only; converting to Responses API format.")
+        if "messages" in payload:
+            payload["input"] = _convert_messages_to_input(payload.pop("messages"))
+        if "max_tokens" in payload:
+            payload["max_output_tokens"] = payload.pop("max_tokens")
+        _target_url = TARGET_ZEN_RESPONSES_URL
+
     client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
     headers = get_realistic_headers(client_key)
     for k, v in raw_request.headers.items():
@@ -1753,7 +1794,7 @@ async def chat_completions(raw_request: Request):
             egress_key = await pace_egress_request(proxies)
             session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
             response = session.post(
-                TARGET_ZEN_URL,
+                _target_url,
                 json=payload,
                 headers=headers,
                 impersonate="chrome124",
