@@ -65,8 +65,7 @@ services:
       - OPENCODE_ZEN_PORT=8000
       - OPENCODE_ZEN_HOST=0.0.0.0
       - OPENCODE_ZEN_TARGET_BASE=https://opencode.ai/zen/v1
-      # 出站统一走 mihomo 混合端口（节点池）
-      - CUSTOM_OUTBOUND_PROXY=http://mihomo:7890
+      # 出站统一走自定义代理池（用户要求禁用 mihomo）
       # 429/空流等场景由 rotator 负责换节点
       - WARP_ROTATOR_URL=http://rotator:8001
       # 面板管理：访问 mihomo API 做热重载 + 共享配置目录路径

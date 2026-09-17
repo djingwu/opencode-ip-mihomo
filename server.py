@@ -7,6 +7,7 @@ import signal
 import sqlite3
 import threading
 import time
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -803,6 +804,22 @@ def normalize_anthropic_request(body: dict) -> dict:
         normalized["system"] = [{"type": "text", "text": system}]
     return normalized
 
+def _random_opencode_id(prefix: str, descending: bool = True) -> str:
+    """生成 OpenCode CLI 格式的 ID，如 msg_xxx / ses_xxx
+    格式：前缀 + 12位hex时间戳 + 14位随机base62 = 30字符
+    与 opencode 源码 packages/schema/src/identifier.ts 一致"""
+    import time
+    import secrets
+    timestamp_ms = int(time.time() * 1000)
+    current = (timestamp_ms * 0x1000) + 0
+    value = ~current if descending else current
+    time_hex = format(value & 0xffffffffffff, '012x')
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    rand = ''.join(secrets.choice(chars) for _ in range(14))
+    return f"{prefix}_{time_hex}{rand}"
+
+
+
 def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
     if client_key:
         with _session_cache_lock:
@@ -815,8 +832,11 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
         "Accept": "application/json, text/event-stream, */*",
-        "User-Agent": "OpenCode-IP-Rotator/1.0",
-        "x-opencode-session": session,
+        "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+        "x-opencode-client": "cli",
+        "x-opencode-project": "global",
+        "x-opencode-request": _random_opencode_id("msg", descending=False),
+        "x-opencode-session": _random_opencode_id("ses", descending=True),
     }
 
 
