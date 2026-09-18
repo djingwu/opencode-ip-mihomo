@@ -1255,13 +1255,42 @@ def _convert_responses_to_chat(resp: dict, model_name: str) -> dict:
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
-# 按客户端标识缓存 x-opencode-session，同一客户端复用同一 session
+# session → proxy 绑定：不同会话使用不同代理出口
+# 无上限增长 = 慢泄漏：只有失败分支 pop，正常会话永不清理。按 TTL 淘汰。
+_session_proxy_map: Dict[str, tuple] = {}
+_session_proxy_map_lock = threading.Lock()
+SESSION_PROXY_TTL_SECONDS = max(60, int(os.environ.get("SESSION_PROXY_TTL_SECONDS", "3600")))
+# 按客户端标识缓存 x-opencode-session，同样加软上限防刷 key
 _session_cache: Dict[str, str] = {}
 _session_cache_lock = threading.Lock()
+SESSION_CACHE_MAX_KEYS = max(100, int(os.environ.get("SESSION_CACHE_MAX_KEYS", "5000")))
 
-# session → proxy 绑定：不同会话使用不同代理出口
-_session_proxy_map: Dict[str, str] = {}
-_session_proxy_map_lock = threading.Lock()
+
+def _session_proxy_get(session_key: str):
+    with _session_proxy_map_lock:
+        entry = _session_proxy_map.get(session_key)
+        if entry is None:
+            return None
+        proxy, expires_at = entry
+        if expires_at < time.monotonic():
+            _session_proxy_map.pop(session_key, None)
+            return None
+        return proxy
+
+
+def _session_proxy_set(session_key: str, proxy_url: str) -> None:
+    with _session_proxy_map_lock:
+        if len(_session_proxy_map) >= SESSION_CACHE_MAX_KEYS and session_key not in _session_proxy_map:
+            # 淘汰最早过期的一个，避免无脑 pop 影响热 key
+            oldest_key = min(_session_proxy_map, key=lambda k: _session_proxy_map[k][1], default=None)
+            if oldest_key is not None:
+                _session_proxy_map.pop(oldest_key, None)
+        _session_proxy_map[session_key] = (proxy_url, time.monotonic() + SESSION_PROXY_TTL_SECONDS)
+
+
+def _session_proxy_pop(session_key: str) -> None:
+    with _session_proxy_map_lock:
+        _session_proxy_map.pop(session_key, None)
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -1463,7 +1492,9 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
     if client_key:
         with _session_cache_lock:
             if client_key not in _session_cache:
-                _session_cache[client_key] = f"dsh-opencode-go-session-{uuid.uuid4().hex[:12]}"
+                if len(_session_cache) >= SESSION_CACHE_MAX_KEYS:
+                    _session_cache.pop(next(iter(_session_cache)), None)
+                _session_cache[client_key] = _random_opencode_id("ses", descending=True)
             session = _session_cache[client_key]
     else:
         session = os.environ.get("OPENCODE_SESSION", "dsh-opencode-go-session")
@@ -1475,8 +1506,38 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
         "x-opencode-request": _random_opencode_id("msg", descending=False),
-        "x-opencode-session": _random_opencode_id("ses", descending=True),
+        # 同一 client_key 复用同一 session：原来每次随机，亲和失效 + map 堆垃圾。
+        # 无 key 匿名请求保持每次随机（无法区分客户端，随机反而能分散代理）。
+        "x-opencode-session": session if client_key else _random_opencode_id("ses", descending=True),
     }
+
+
+UPSTREAM_API_KEY_OVERRIDE = os.environ.get("UPSTREAM_API_KEY", "").strip()
+
+
+def apply_downstream_auth(headers, raw_request):
+    try:
+        # 服务端强制替换：下游 key 不可信时一律用配置的有效 key 上游。
+        if UPSTREAM_API_KEY_OVERRIDE and UPSTREAM_API_KEY_OVERRIDE.lower() != "public":
+            _k = UPSTREAM_API_KEY_OVERRIDE
+            headers["Authorization"] = _k if _k.lower().startswith("bearer ") else "Bearer " + _k
+            return headers
+        import hashlib as _hl
+        auth = raw_request.headers.get("authorization", "") or ""
+        api_key = raw_request.headers.get("x-api-key", "") or ""
+        _cred = (auth or api_key or "").strip()
+        if _cred:
+            _fp = _hl.sha256(_cred.encode()).hexdigest()[:12]
+            log.warning("downstream credential seen src=%s fp=%s len=%d",
+                        "authorization" if auth else "x-api-key", _fp, len(_cred))
+        if auth and auth.strip().lower() != "bearer public":
+            headers["Authorization"] = auth.strip()
+        elif api_key and api_key.strip().lower() != "public":
+            v = api_key.strip()
+            headers["Authorization"] = v if v.lower().startswith("bearer ") else "Bearer " + v
+    except Exception:
+        pass
+    return headers
 
 
 SAFE_UPSTREAM_HEADERS = {
@@ -2459,6 +2520,7 @@ async def chat_completions(raw_request: Request):
     for k, v in raw_request.headers.items():
         if k.lower().startswith("x-opencode-"):
             headers[k] = v
+    headers = apply_downstream_auth(headers, raw_request)
 
     # 会话标识：优先用客户端传入的 x-opencode-session，否则用 client_key
     session_key = headers.get("x-opencode-session", "") or client_key
@@ -2694,6 +2756,7 @@ async def anthropic_messages(raw_request: Request):
         kl = k.lower()
         if kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
             headers[k] = v
+    headers = apply_downstream_auth(headers, raw_request)
 
     # 会话标识：优先用客户端传入的 x-opencode-session
     session_key = headers.get("x-opencode-session", "") or client_api_key
