@@ -115,17 +115,15 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
 
     # session 绑定：同一会话复用同一代理
     if session_key:
-        with _session_proxy_map_lock:
-            bound_proxy = _session_proxy_map.get(session_key)
+        bound_proxy = _session_proxy_get(session_key)
         if bound_proxy:
             # 检查绑定的代理是否仍可用
             if proxy_pool.is_proxy_eligible(bound_proxy):
                 return {"http": bound_proxy, "https": bound_proxy}
             else:
                 # 代理不可用，清除绑定
-                with _session_proxy_map_lock:
-                    _session_proxy_map.pop(session_key, None)
-                log.info(f"Session {session_key[:20]}... bound proxy {bound_proxy} unavailable; will reselect.")
+                _session_proxy_pop(session_key)
+                log.debug(f"Session {session_key[:20]}... bound proxy {bound_proxy} unavailable; will reselect.")
 
     if route.get("mode") == "mihomo" and route.get("hold_mihomo") is True:
         if custom_proxy:
@@ -135,29 +133,27 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
     # 为新 session 选代理：优先选空闲（未被其他 session 绑定）的代理
     if session_key:
         with _session_proxy_map_lock:
-            bound_proxies = set(_session_proxy_map.values())
+            bound_proxies = {proxy for proxy, _ in _session_proxy_map.values()}
         all_eligible = proxy_pool.eligible_proxies()
         if all_eligible:
             # 空闲代理 = 可用但未被任何 session 绑定的
             free_proxies = [p for p in all_eligible if p not in bound_proxies]
-            log.info(f"Session {session_key[:20]}... proxy selection: {len(all_eligible)} eligible, {len(bound_proxies)} bound, {len(free_proxies)} free")
+            log.debug(f"Session {session_key[:20]}... proxy selection: {len(all_eligible)} eligible, {len(bound_proxies)} bound, {len(free_proxies)} free")
             if free_proxies:
                 proxy_url = proxy_pool.select_active_proxy(free_proxies)
-                log.info(f"Session {session_key[:20]}... selected free proxy: {proxy_url}")
+                log.debug(f"Session {session_key[:20]}... selected free proxy: {proxy_url}")
             else:
                 # 所有可用代理都被绑定了，选一个负载最少的
                 proxy_url = proxy_pool.select_active_proxy(all_eligible)
-                log.info(f"Session {session_key[:20]}... all proxies bound, selected: {proxy_url}")
+                log.debug(f"Session {session_key[:20]}... all proxies bound, selected: {proxy_url}")
             if proxy_url:
-                with _session_proxy_map_lock:
-                    _session_proxy_map[session_key] = proxy_url
+                _session_proxy_set(session_key, proxy_url)
                 return {"http": proxy_url, "https": proxy_url}
 
     proxy_url = proxy_pool.select_active_proxy(_proxy_pool)
     if proxy_url:
         if session_key:
-            with _session_proxy_map_lock:
-                _session_proxy_map[session_key] = proxy_url
+            _session_proxy_set(session_key, proxy_url)
         return {"http": proxy_url, "https": proxy_url}
     if custom_proxy:
         if route.get("mode") != "mihomo":
@@ -186,17 +182,30 @@ def _mark_request_proxy_failure(proxies: Optional[Dict[str, str]]) -> None:
 # -----------------------------------------------------------------------------
 DB_FILE = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
 _db_lock = threading.Lock()
+_db_pragmas_applied = False
+
+
+def _apply_db_pragmas(conn) -> None:
+    """One-time WAL setup; per-connection PRAGMA on every open is a write txn."""
+    global _db_pragmas_applied
+    if not _db_pragmas_applied:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        _db_pragmas_applied = True
+
 
 def _get_conn():
     conn = sqlite3.connect(str(DB_FILE), timeout=5)
-    conn.execute("PRAGMA journal_mode=WAL")
+    _apply_db_pragmas(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 def _get_conn_row():
     conn = sqlite3.connect(str(DB_FILE), timeout=5)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    _apply_db_pragmas(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -234,6 +243,114 @@ def _db_fetchall(statement: str, params=()) -> list:
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise
+
+def _db_executemany(statement: str, rows) -> int:
+    rows = list(rows)
+    if not rows:
+        return 0
+    for attempt in range(3):
+        try:
+            with _db_lock:
+                conn = _get_conn()
+                try:
+                    cursor = conn.cursor()
+                    cursor.executemany(statement, rows)
+                    conn.commit()
+                    return cursor.rowcount
+                finally:
+                    conn.close()
+        except sqlite3.OperationalError as e:
+            if "busy" in str(e).lower() and attempt < 2:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
+    return 0
+
+
+# --- metrics write batching -------------------------------------------------
+# 请求热路径只做内存聚合 + 入队，后台线程批量刷盘，避免每请求抢 _db_lock。
+# lease 表保持同步写：rotator 跨进程读它来挡轮换，不能只放内存。
+_pending_usage_rows: deque = deque(maxlen=5000)
+_pending_history_rows: deque = deque(maxlen=5000)
+_metrics_flush_stop = threading.Event()
+_metrics_flush_thread_started = False
+
+
+def _prune_request_history() -> None:
+    try:
+        cutoff = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(time.time() - REQUEST_HISTORY_RETENTION_DAYS * 86400),
+        )
+        _db_execute(
+            "DELETE FROM request_history WHERE created_at < ? OR timestamp < ?",
+            (cutoff, cutoff),
+        )
+        _db_execute(
+            "DELETE FROM request_history WHERE id NOT IN "
+            "(SELECT id FROM request_history ORDER BY id DESC LIMIT ?)",
+            (REQUEST_HISTORY_MAX_ROWS,),
+        )
+    except Exception:
+        pass
+
+
+def _flush_metrics_buffers() -> None:
+    usage_batch = []
+    history_batch = []
+    while _pending_usage_rows and len(usage_batch) < METRICS_FLUSH_MAX_ROWS:
+        try:
+            usage_batch.append(_pending_usage_rows.popleft())
+        except IndexError:
+            break
+    while _pending_history_rows and len(history_batch) < METRICS_FLUSH_MAX_ROWS:
+        try:
+            history_batch.append(_pending_history_rows.popleft())
+        except IndexError:
+            break
+    if usage_batch:
+        try:
+            _db_executemany("""
+                INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(model_name) DO UPDATE SET
+                    requests = requests + excluded.requests,
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                    updated_at = CURRENT_TIMESTAMP
+            """, usage_batch)
+        except Exception as e:
+            log.error(f"Failed to flush usage buffer to SQLite: {e}")
+    if history_batch:
+        try:
+            _db_executemany(
+                """INSERT INTO request_history
+                   (timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream, attempt, error_msg)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                history_batch,
+            )
+        except Exception:
+            pass
+        _prune_request_history()
+
+
+def _metrics_flush_loop() -> None:
+    while not _metrics_flush_stop.is_set():
+        _metrics_flush_stop.wait(METRICS_FLUSH_INTERVAL_SECONDS)
+        try:
+            _flush_metrics_buffers()
+        except Exception:
+            pass
+
+
+def start_metrics_flusher() -> None:
+    global _metrics_flush_thread_started
+    if _metrics_flush_thread_started:
+        return
+    _metrics_flush_thread_started = True
+    threading.Thread(target=_metrics_flush_loop, name="metrics-flusher", daemon=True).start()
 
 def init_db():
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -290,6 +407,10 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    _db_execute(
+        "CREATE INDEX IF NOT EXISTS idx_request_history_created "
+        "ON request_history(created_at)"
+    )
 
 
 def acquire_flow_lease() -> str:
@@ -318,12 +439,9 @@ def record_request_history(
     attempt: int = 1,
     error_msg: str = "",
 ):
-    """Record a single request to the request_history table."""
+    """Buffer one request row; flushed in batches by _metrics_flush_loop."""
     try:
-        _db_execute(
-            """INSERT INTO request_history
-               (timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream, attempt, error_msg)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        _pending_history_rows.append(
             (
                 time.strftime("%Y-%m-%d %H:%M:%S"),
                 model,
@@ -334,7 +452,7 @@ def record_request_history(
                 1 if is_stream else 0,
                 attempt,
                 error_msg[:200] if error_msg else "",
-            ),
+            )
         )
     except Exception:
         pass
@@ -495,9 +613,15 @@ _rotation_in_progress = threading.Event()
 _request_drain_event = asyncio.Event()
 _request_drain_event.set()
 
+# 轮换超时与 drain：原来 rotate 35s + drain 15s，一次轮换冻结所有新请求至多 50s。
+# rotator 侧单次 mihomo 验证约 2s + 两次外部 IP 查询（各 5~10s），10s 足够判定失败并重试。
+ROTATE_REQUEST_TIMEOUT_SECONDS = max(5, int(os.environ.get("ROTATE_REQUEST_TIMEOUT_SECONDS", "10")))
+ROTATION_DRAIN_TIMEOUT_SECONDS = max(2, int(os.environ.get("ROTATION_DRAIN_TIMEOUT_SECONDS", "5")))
+
+
 async def wait_for_rotation_drain():
     if _rotation_in_progress.is_set():
-        await asyncio.wait_for(_request_drain_event.wait(), timeout=15)
+        await asyncio.wait_for(_request_drain_event.wait(), timeout=ROTATION_DRAIN_TIMEOUT_SECONDS)
 
 def signal_rotation_start():
     _rotation_in_progress.set()
@@ -539,6 +663,64 @@ MODEL_PRICING = {
 
 _model_usage_lock = threading.Lock()
 
+# --- /metrics snapshot cache + egress status cache ---------------------------
+# /metrics 原来每次都 doing DB 全表 + rotator HTTP + 外部 IP 库，被每秒抓取时就是烧 CPU。
+_metrics_snapshot = None
+_metrics_snapshot_at = 0.0
+_metrics_snapshot_lock = threading.Lock()
+
+# 出口状态由后台线程定期刷新（默认 60s），/health 与 /metrics 只读缓存，不再同步打外部站
+_egress_cache = {"ok": True, "ip": None, "db_ok": True, "checked_at": 0.0}
+_egress_cache_lock = threading.Lock()
+EGRESS_STATUS_INTERVAL_SECONDS = max(15, int(os.environ.get("EGRESS_STATUS_INTERVAL_SECONDS", "60")))
+_egress_watch_stop = threading.Event()
+_egress_watch_started = False
+
+
+def _read_egress_cache():
+    with _egress_cache_lock:
+        return dict(_egress_cache)
+
+
+def _refresh_egress_cache() -> None:
+    ok = False
+    ip = None
+    try:
+        ip = get_public_ip()
+        ok = bool(ip) and ip != "Disconnected"
+    except Exception:
+        ok = False
+    db_ok = False
+    try:
+        _db_execute("SELECT 1")
+        db_ok = True
+    except Exception:
+        pass
+    with _egress_cache_lock:
+        _egress_cache.update({"ok": ok, "ip": ip, "db_ok": db_ok, "checked_at": time.time()})
+    try:
+        prom_warp_health.set(1 if ok else 0)
+    except Exception:
+        pass
+
+
+def _egress_watch_loop() -> None:
+    _refresh_egress_cache()
+    while not _egress_watch_stop.is_set():
+        _egress_watch_stop.wait(EGRESS_STATUS_INTERVAL_SECONDS)
+        try:
+            _refresh_egress_cache()
+        except Exception:
+            pass
+
+
+def start_egress_watcher() -> None:
+    global _egress_watch_started
+    if _egress_watch_started:
+        return
+    _egress_watch_started = True
+    threading.Thread(target=_egress_watch_loop, name="egress-watcher", daemon=True).start()
+
 def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0):
     global model_usage_stats
     pricing = MODEL_PRICING.get(model_name, {"input_per_1m": 0.20, "output_per_1m": 0.80})
@@ -558,20 +740,13 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
         model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
         model_usage_stats[model_name]["estimated_cost_usd"] += cost
 
+    # 热路径只入队，后台线程批量刷盘；内存统计已实时更新，/metrics 不依赖本条落盘
     try:
-        _db_execute("""
-            INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(model_name) DO UPDATE SET
-                requests = requests + excluded.requests,
-                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
-                completion_tokens = completion_tokens + excluded.completion_tokens,
-                total_tokens = total_tokens + excluded.total_tokens,
-                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                updated_at = CURRENT_TIMESTAMP
-        """, (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost))
-    except Exception as e:
-        log.error(f"Failed to persist metrics to SQLite: {e}")
+        _pending_usage_rows.append(
+            (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost)
+        )
+    except Exception:
+        pass
 
 # -----------------------------------------------------------------------------
 # WARP Quality Metrics
@@ -628,7 +803,15 @@ TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
 MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "4"))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 UPSTREAM_RPM = float(os.environ.get("UPSTREAM_RPM", "10"))
-MAX_UPSTREAM_CONCURRENCY = max(1, int(os.environ.get("MAX_UPSTREAM_CONCURRENCY", "20")))
+# 单核小机器默认 4：上游是单并发契约，20 并发只会排队 sleep + 429 + 轮换风暴
+MAX_UPSTREAM_CONCURRENCY = max(1, int(os.environ.get("MAX_UPSTREAM_CONCURRENCY", "4")))
+# /metrics 重型快照缓存（秒）：命中时直接复用，不再调 rotator/外部 IP 库
+METRICS_CACHE_TTL_SECONDS = max(5, int(os.environ.get("METRICS_CACHE_TTL_SECONDS", "15")))
+# token/history 批量刷盘：请求只写内存，后台线程定时 flush，避免每请求抢 _db_lock
+METRICS_FLUSH_INTERVAL_SECONDS = max(1, int(os.environ.get("METRICS_FLUSH_INTERVAL_SECONDS", "10")))
+METRICS_FLUSH_MAX_ROWS = max(10, int(os.environ.get("METRICS_FLUSH_MAX_ROWS", "200")))
+REQUEST_HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("REQUEST_HISTORY_RETENTION_DAYS", "7")))
+REQUEST_HISTORY_MAX_ROWS = max(1000, int(os.environ.get("REQUEST_HISTORY_MAX_ROWS", "10000")))
 RATE_LIMIT_ROTATION_THRESHOLD = max(1, int(os.environ.get("RATE_LIMIT_ROTATION_THRESHOLD", "2")))
 MAX_RATE_LIMIT_WAIT = max(0.0, float(os.environ.get("MAX_RATE_LIMIT_WAIT", "8")))
 NETWORK_FAILURE_ROTATION_THRESHOLD = max(1, int(os.environ.get("NETWORK_FAILURE_ROTATION_THRESHOLD", "2")))
@@ -990,6 +1173,9 @@ async def lifespan(application: FastAPI):
         log.warning("mihomo config migration failed: %s", exc)
     init_db()
     model_usage_stats = load_metrics_from_db()
+    # 出口状态由后台 watcher 异步首刷；启动路径不同步打外部站，避免拖慢 boot
+    start_egress_watcher()
+    start_metrics_flusher()
     _discovery_stop.clear()
     # 容器重建后 mihomo 不保留 file provider 的内存测速历史。后台等待控制器
     # 就绪并主动触发一次健康检查，使 free 节点尽快从“未检测”恢复。
@@ -1000,6 +1186,12 @@ async def lifespan(application: FastAPI):
     ).start()
     threading.Thread(target=discover_models_task, daemon=True).start()
     yield
+    _metrics_flush_stop.set()
+    _egress_watch_stop.set()
+    try:
+        _flush_metrics_buffers()
+    except Exception:
+        pass
     _close_all_sessions()
     _discovery_stop.set()
 
@@ -1235,7 +1427,7 @@ def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
 def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
     """Request rotation from the service that owns the shared WARP namespace."""
     try:
-        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
+        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=ROTATE_REQUEST_TIMEOUT_SECONDS)
         data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
         if response.status_code == 200 and data.get("status") == "success":
             return True, data.get("verified_ip")
@@ -1249,8 +1441,13 @@ def _egress_policy_key(proxies: Optional[Dict[str, str]]) -> str:
     proxy_url = _request_proxy_url(proxies)
     if proxy_url:
         return f"proxy:{proxy_url}"
+    # 稳定键：同一 mihomo 出口复用同一 pacing 槽。原来的 updated_at 一切换就变，
+    # 老槽的 next_allowed 直接作废，等于 pacing 失效后突发打上游。
     route = proxy_pool.routing_snapshot()
-    return f"mihomo:{route.get('updated_at', 0)}"
+    mode = route.get("mode", "mihomo")
+    if mode == "mihomo":
+        return "mihomo:active"
+    return f"{mode}:{route.get('active_proxy') or 'default'}"
 
 
 async def pace_egress_request(proxies: Optional[Dict[str, str]]) -> str:
@@ -1258,7 +1455,8 @@ async def pace_egress_request(proxies: Optional[Dict[str, str]]) -> str:
     egress_key = _egress_policy_key(proxies)
     wait_seconds = _egress_rate_policy.reserve(egress_key)
     if wait_seconds > 0:
-        log.info("Pacing %s for %.2fs to stay within %.1f RPM.", egress_key, wait_seconds, UPSTREAM_RPM)
+        # 高频路径：INFO 会烧磁盘 + 拖慢单核机，只在 DEBUG 留
+        log.debug("Pacing %s for %.2fs to stay within %.1f RPM.", egress_key, wait_seconds, UPSTREAM_RPM)
         await asyncio.sleep(wait_seconds)
     return egress_key
 
@@ -1636,8 +1834,10 @@ async def stream_response(response, model_name: str, session=None, protocol: str
 
         log.info("Streaming completed successfully for '%s' (%s lines sent).", model_name, chunk_count)
     except EmptyStreamError:
+        _discard_stream_session = True
         raise
     except GeneratorExit:
+        _discard_stream_session = True
         log.warning(
             "[STREAM DEBUG] Client explicitly closed/aborted SSE for '%s' after %s lines.",
             model_name, chunk_count,
@@ -1942,9 +2142,29 @@ async def panel_fetch_free_nodes(body: FetchFreeNodesBody):
 
 @app.get("/metrics")
 async def get_metrics():
+    """Cached snapshot: heavy rebuild (DB + rotator + external IP) at most every TTL."""
+    global _metrics_snapshot, _metrics_snapshot_at
+    now = time.monotonic()
+    with _metrics_snapshot_lock:
+        if _metrics_snapshot is not None and (now - _metrics_snapshot_at) < METRICS_CACHE_TTL_SECONDS:
+            snapshot = dict(_metrics_snapshot)
+            snapshot["uptime_seconds"] = int(time.time() - metrics["start_time"])
+            snapshot["active_flows"] = active_flows_count
+            snapshot["metrics"] = metrics
+            snapshot["model_usage"] = model_usage_stats
+            snapshot["rotation_in_progress"] = _rotation_in_progress.is_set()
+            return snapshot
+    fresh = await _build_metrics_snapshot()
+    with _metrics_snapshot_lock:
+        _metrics_snapshot = fresh
+        _metrics_snapshot_at = time.monotonic()
+    return fresh
+
+
+async def _build_metrics_snapshot():
     uptime = int(time.time() - metrics["start_time"])
 
-    # Always ensure full historical stats from SQLite DB are included
+    # 内存统计已实时聚合；DB 合并只在快照重建时做一次对齐（重启恢复场景）
     db_usage = load_metrics_from_db()
     for m_name, m_data in db_usage.items():
         if m_name not in model_usage_stats:
@@ -2017,21 +2237,32 @@ async def get_metrics():
 
 @app.get("/health")
 async def health():
-    ip = get_public_ip()
-    prom_warp_health.set(1 if ip and ip != "Disconnected" else 0)
-    db_ok = False
-    try:
-        _db_execute("SELECT 1")
-        db_ok = True
-    except Exception:
-        pass
+    """轻量健康检查：只读内存 + 后台缓存，绝不同步打外部站，docker 每 30s 调一次。"""
+    state = _read_egress_cache()
+    db_ok = bool(state.get("db_ok", True))
     return {
         "status": "healthy" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
+        "egress_ok": bool(state.get("ok", True)),
         "uptime_seconds": int(time.time() - metrics["start_time"]),
         "active_flows": active_flows_count,
         "total_rotations": rotation_count,
         "warp_quality": dict(warp_quality_stats),
+    }
+
+
+@app.get("/ready")
+async def ready():
+    """就绪探针：DB 可用即 ready；出口状态只看后台缓存，不阻塞。"""
+    state = _read_egress_cache()
+    db_ok = bool(state.get("db_ok", True))
+    if not db_ok:
+        raise HTTPException(status_code=503, detail="database unreachable")
+    return {
+        "status": "ready",
+        "egress_ok": bool(state.get("ok", True)),
+        "uptime_seconds": int(time.time() - metrics["start_time"]),
+        "active_flows": active_flows_count,
     }
 
 @app.get("/v1/models")
@@ -2183,15 +2414,6 @@ async def chat_completions(raw_request: Request):
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
-            record_request_history(
-                model=current_model,
-                proxy_ip=_request_proxy_url(proxies) or "",
-                egress_ip=egress_key,
-                latency_ms=round((time.time() - start_time) * 1000, 1),
-                status="ok",
-                is_stream=is_stream,
-                attempt=attempt,
-            )
 
             if is_stream:
                 try:
@@ -2545,4 +2767,21 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 if __name__ == "__main__":
     load_proxy_list()
     log.info(f"Starting OpenCode IP Proxy Server on {HOST}:{PORT}...")
-    uvicorn.run(app, host=HOST, port=PORT)
+    _uvicorn_kwargs = {
+        "host": HOST,
+        "port": PORT,
+        "timeout_keep_alive": int(os.environ.get("UVICORN_KEEPALIVE_TIMEOUT", "30")),
+        "limit_concurrency": max(MAX_UPSTREAM_CONCURRENCY * 4, int(os.environ.get("UVICORN_LIMIT_CONCURRENCY", "32"))),
+        "limit_max_requests": int(os.environ.get("UVICORN_LIMIT_MAX_REQUESTS", "0")) or None,
+    }
+    try:
+        import uvloop  # noqa: F401
+        _uvicorn_kwargs["loop"] = os.environ.get("UVICORN_LOOP", "uvloop")
+    except Exception:
+        pass
+    try:
+        import httptools  # noqa: F401
+        _uvicorn_kwargs["http"] = os.environ.get("UVICORN_HTTP", "httptools")
+    except Exception:
+        pass
+    uvicorn.run(app, **{k: v for k, v in _uvicorn_kwargs.items() if v is not None})
