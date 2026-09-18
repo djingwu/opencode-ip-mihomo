@@ -58,6 +58,52 @@ MODEL_TIMEOUT_OVERRIDES = {
 ANTHROPIC_MIN_MAX_TOKENS = max(0, int(os.environ.get("ANTHROPIC_MIN_MAX_TOKENS", "128")))
 FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
 FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
+# SSE 批量取行：原来每行一次 run_in_executor，1 核机上全是 GIL 切换开销
+STREAM_FETCH_BATCH = max(1, int(os.environ.get("STREAM_FETCH_BATCH", "32")))
+
+
+def _drain_line_batch(get_next_line, line_iter, limit: int):
+    out = []
+    for _ in range(limit):
+        try:
+            item = get_next_line(line_iter)
+        except Exception:
+            break
+        out.append(item)
+        if item in ("STOP_ITERATION", "SOCKET_ERROR", None):
+            break
+    return out
+
+
+async def _fetch_line_batch(loop, get_next_line, line_iter, limit: int):
+    return await loop.run_in_executor(None, _drain_line_batch, get_next_line, line_iter, limit)
+
+
+async def _post_upstream(session, url, *, json_body, headers, proxies, timeout):
+    """同步 curl_cffi post 必须走线程池，否则阻塞事件循环拖住所有连接。"""
+    return await asyncio.to_thread(
+        session.post,
+        url,
+        json=json_body,
+        headers=headers,
+        impersonate="chrome124",
+        stream=False,
+        proxies=proxies,
+        timeout=timeout,
+    )
+
+
+async def _post_upstream_stream(session, url, *, json_body, headers, proxies, timeout):
+    return await asyncio.to_thread(
+        session.post,
+        url,
+        json=json_body,
+        headers=headers,
+        impersonate="chrome124",
+        stream=True,
+        proxies=proxies,
+        timeout=timeout,
+    )
 
 # -----------------------------------------------------------------------------
 # JSON Structured Logging
@@ -548,16 +594,57 @@ def _get_session(endpoint: str):
             _session_pool[endpoint] = SessionType(**kwargs)
         return _session_pool[endpoint]
 
-def create_fresh_session(is_stream: bool):
+# --- stream session pool (per endpoint+egress, keepalive) --------------------
+# 流式原来每次新建 Session（socks5h 下每次多一次 CONNECT+TLS 握手）。
+# 按出口 key 做小池复用，失败才丢弃；成功用完归还，不断开 keepalive。
+_stream_pool: Dict[str, list] = {}
+_stream_pool_lock = threading.Lock()
+STREAM_POOL_SIZE = max(1, int(os.environ.get("STREAM_POOL_SIZE", "2")))
+
+
+def _stream_pool_key(endpoint: str, egress_key: str) -> str:
+    return f"{endpoint}|{egress_key}"
+
+
+def _get_stream_session(endpoint: str, egress_key: str):
+    """Borrow a keepalive session for streaming; caller must release it."""
     global SessionType
     if SessionType is None:
         from curl_cffi.requests import Session as SessionType
+    key = _stream_pool_key(endpoint, egress_key)
+    with _stream_pool_lock:
+        bucket = _stream_pool.get(key)
+        if bucket:
+            try:
+                return bucket.pop(), key, False
+            except IndexError:
+                pass
     kwargs = {}
     if not ENABLE_HTTP2:
         from curl_cffi import CurlHttpVersion
         kwargs["http_version"] = CurlHttpVersion.V1_1
-    kwargs["curl_options"] = {48: 0}  # LOW_SPEED_TIME=0 disables low-speed limit
-    return SessionType(**kwargs)
+    kwargs["curl_options"] = {48: 0}
+    return SessionType(**kwargs), key, True
+
+
+def _release_stream_session(pool_key: str, session, discard: bool = False) -> None:
+    if session is None:
+        return
+    if discard:
+        try:
+            session.close()
+        except Exception:
+            pass
+        return
+    with _stream_pool_lock:
+        bucket = _stream_pool.setdefault(pool_key, [])
+        if len(bucket) < STREAM_POOL_SIZE:
+            bucket.append(session)
+            return
+    try:
+        session.close()
+    except Exception:
+        pass
 
 def _close_all_sessions():
     with _session_pool_lock:
@@ -567,6 +654,14 @@ def _close_all_sessions():
             except Exception:
                 pass
         _session_pool.clear()
+    with _stream_pool_lock:
+        for _key, bucket in _stream_pool.items():
+            for sess in bucket:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+        _stream_pool.clear()
 
 def _invalidate_session(endpoint: str, expected_session=None):
     """Close and drop a pooled session so the next attempt builds a fresh one.
@@ -592,9 +687,12 @@ def _invalidate_session(endpoint: str, expected_session=None):
             pass
 
 
-def _reset_request_session(endpoint: str, session, pooled: bool) -> None:
+def _reset_request_session(endpoint: str, session, pooled: bool, stream_pool_key=None) -> None:
     """Make a request session safe to retry after a failed attempt."""
     if session is None:
+        return
+    if stream_pool_key is not None:
+        _release_stream_session(stream_pool_key, session, discard=True)
         return
     if pooled:
         _invalidate_session(endpoint, expected_session=session)
@@ -977,7 +1075,6 @@ async def responses_stream_as_chat(response, model_name: str):
     message_id = f"chatcmpl-{uuid.uuid4().hex[:20]}"
     created = int(time.time())
     reasoning_text = ""
-    full_text = ""
     finish_reason = "stop"
     usage = {}
     tool_call_state = {}
@@ -1009,87 +1106,108 @@ async def responses_stream_as_chat(response, model_name: str):
             return None
 
     line_iter = response.iter_lines()
-    while True:
-        item = await loop.run_in_executor(None, get_next_line, line_iter)
-        if item is None:
-            break
-        if not item:
-            yield b"\n"
-            continue
+    _prefetch = []
+    _discard_stream_session = False
 
-        raw = item.decode("utf-8", errors="ignore").strip()
-        if raw.startswith("event:"):
-            pending_sse_event = raw[6:].strip()
-            continue
-        if not raw.startswith("data:"):
-            continue
+    async def _next_stream_item():
+        nonlocal _prefetch
+        if not _prefetch:
+            _prefetch = await _fetch_line_batch(loop, get_next_line, line_iter, STREAM_FETCH_BATCH)
+            if not _prefetch:
+                return None
+        return _prefetch.pop(0)
 
-        pending_sse_event = ""
-        try:
-            data = json.loads(raw[5:])
-        except json.JSONDecodeError:
-            continue
+    try:
+        while True:
+            item = await _next_stream_item()
+            if item is None:
+                break
+            if not item:
+                yield b"\n"
+                continue
 
-        event_type = data.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta_text = data.get("delta", "")
-            full_text += delta_text
-            yield make_chunk({"content": delta_text})
-        elif event_type == "response.output_text.done":
-            pass  # 内容已通过 delta 发送
-        elif event_type == "response.completed":
-            resp_data = data.get("response") or {}
-            usage = resp_data.get("usage", {})
-            status = resp_data.get("status", "completed")
-            incomplete = resp_data.get("incomplete_details") or {}
-            if status == "incomplete" and incomplete.get("reason") == "max_output_tokens":
-                finish_reason = "length"
-        elif event_type == "response.output_item.added":
-            item = data.get("item") or {}
-            if item.get("type") == "function_call":
+            raw = item.decode("utf-8", errors="ignore").strip()
+            if raw.startswith("event:"):
+                pending_sse_event = raw[6:].strip()
+                continue
+            if not raw.startswith("data:"):
+                continue
+
+            pending_sse_event = ""
+            try:
+                data = json.loads(raw[5:])
+            except json.JSONDecodeError:
+                continue
+
+            event_type = data.get("type", "")
+            if event_type == "response.output_text.delta":
+                delta_text = data.get("delta", "")
+                yield make_chunk({"content": delta_text})
+            elif event_type == "response.output_text.done":
+                pass  # 内容已通过 delta 发送
+            elif event_type == "response.completed":
+                resp_data = data.get("response") or {}
+                usage = resp_data.get("usage", {})
+                status = resp_data.get("status", "completed")
+                incomplete = resp_data.get("incomplete_details") or {}
+                if status == "incomplete" and incomplete.get("reason") == "max_output_tokens":
+                    finish_reason = "length"
+            elif event_type == "response.output_item.added":
+                item = data.get("item") or {}
+                if item.get("type") == "function_call":
+                    output_index = data.get("output_index", 0)
+                    key = item.get("id") or output_index
+                    tool_call_state[key] = {
+                        "index": output_index,
+                        "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:20]}",
+                        "name": item.get("name") or "tool",
+                    }
+            elif event_type == "response.function_call_arguments.delta":
                 output_index = data.get("output_index", 0)
-                key = item.get("id") or output_index
-                tool_call_state[key] = {
-                    "index": output_index,
-                    "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:20]}",
-                    "name": item.get("name") or "tool",
-                }
-        elif event_type == "response.function_call_arguments.delta":
-            output_index = data.get("output_index", 0)
-            key = data.get("item_id") or output_index
-            state = tool_call_state.get(key) or tool_call_state.get(output_index)
-            if not state:
-                state = {
-                    "index": output_index,
-                    "id": data.get("call_id") or data.get("item_id") or f"call_{uuid.uuid4().hex[:20]}",
-                    "name": data.get("name") or "tool",
-                }
-                tool_call_state[key] = state
-            yield make_chunk({
-                "tool_calls": [{
-                    "index": state["index"],
-                    "id": state["id"],
-                    "type": "function",
-                    "function": {
-                        "name": state["name"],
-                        "arguments": data.get("delta", ""),
-                    },
-                }]
-            })
-        elif event_type == "error":
-            break
+                key = data.get("item_id") or output_index
+                state = tool_call_state.get(key) or tool_call_state.get(output_index)
+                if not state:
+                    state = {
+                        "index": output_index,
+                        "id": data.get("call_id") or data.get("item_id") or f"call_{uuid.uuid4().hex[:20]}",
+                        "name": data.get("name") or "tool",
+                    }
+                    tool_call_state[key] = state
+                yield make_chunk({
+                    "tool_calls": [{
+                        "index": state["index"],
+                        "id": state["id"],
+                        "type": "function",
+                        "function": {
+                            "name": state["name"],
+                            "arguments": data.get("delta", ""),
+                        },
+                    }]
+                })
+            elif event_type == "error":
+                _discard_stream_session = True
+                break
 
-    # 发 finish chunk
-    yield make_chunk({}, finish_reason)
-    yield b"data: [DONE]\n\n"
+        # 发 finish chunk
+        yield make_chunk({}, finish_reason)
+        yield b"data: [DONE]\n\n"
 
-    # 更新 token usage
-    if usage:
-        track_token_usage(
-            model_name,
-            prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
-            completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
-        )
+        # 更新 token usage
+        if usage:
+            track_token_usage(
+                model_name,
+                prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
+                completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+            )
+    finally:
+        if session is not None:
+            if stream_pool_key is not None:
+                _release_stream_session(stream_pool_key, session, discard=_discard_stream_session)
+            else:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
 
 def _convert_responses_to_chat(resp: dict, model_name: str) -> dict:
@@ -1479,6 +1597,7 @@ async def recover_from_rate_limit(
     pooled: bool,
     egress_key: str,
     attempt: int,
+    stream_pool_key=None,
 ) -> bool:
     """Retry a transient 429 once on the same IP before considering rotation."""
     category, retry_after, _ = classify_upstream_429(response)
@@ -1489,7 +1608,7 @@ async def recover_from_rate_limit(
     if not rotate_now:
         requested_delay = retry_after if retry_after is not None else 0.0
         delay = min(requested_delay, MAX_RATE_LIMIT_WAIT)
-        _reset_request_session(endpoint, session, pooled=pooled)
+        _reset_request_session(endpoint, session, pooled=pooled, stream_pool_key=stream_pool_key)
         log.warning(
             "HTTP 429 for '%s' on %s (streak=%d, retry_after=%s); retaining the egress and retrying in %.2fs.",
             model_name,
@@ -1512,7 +1631,7 @@ async def recover_from_rate_limit(
         log.warning("Confirmed HTTP 429 for '%s', but egress rotation failed.", model_name)
         return False
 
-    _reset_request_session(endpoint, session, pooled=pooled)
+    _reset_request_session(endpoint, session, pooled=pooled, stream_pool_key=stream_pool_key)
     log.warning("Confirmed HTTP 429 for '%s'; egress rotated -> %s. Retrying.", model_name, new_ip)
     return True
 
@@ -1598,7 +1717,7 @@ def _responses_completed_event(model_name: str, latest_response: Optional[dict],
         + b"\n\n"
     )
 
-async def stream_response(response, model_name: str, session=None, protocol: str = "chat") -> AsyncGenerator[bytes, None]:
+async def stream_response(response, model_name: str, session=None, protocol: str = "chat", stream_pool_key=None) -> AsyncGenerator[bytes, None]:
     """Forward SSE and normalize terminal events for the selected API protocol."""
     loop = asyncio.get_event_loop()
     global active_flows_count
@@ -1681,7 +1800,9 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 if "stop_sequence" in event_delta:
                     anthropic_stop_sequence = event_delta.get("stop_sequence")
         if delta:
-            output_text_parts.append(delta)
+            # 只有 responses 补 completion 事件才需要攒全文；chat/anthropic 直接透传
+            if is_responses_api:
+                output_text_parts.append(delta)
         if event_type == "__chat_content__" or event_type in {
             "response.output_text.delta",
             "response.output_text.done",
@@ -1745,8 +1866,18 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 return "SOCKET_ERROR"
 
         line_iter = response.iter_lines()
+        _prefetch = []
+
+        async def _next_stream_item():
+            nonlocal _prefetch
+            if not _prefetch:
+                _prefetch = await _fetch_line_batch(loop, get_next_line, line_iter, STREAM_FETCH_BATCH)
+                if not _prefetch:
+                    return "STOP_ITERATION"
+            return _prefetch.pop(0)
+
         while len(buffered_lines) < 10:
-            item = await loop.run_in_executor(None, get_next_line, line_iter)
+            item = await _next_stream_item()
             if item in ("STOP_ITERATION", "SOCKET_ERROR"):
                 break
             if not item:
@@ -1787,7 +1918,7 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 yield line + b"\n"
 
         while True:
-            item = await loop.run_in_executor(None, get_next_line, line_iter)
+            item = await _next_stream_item()
             if item == "STOP_ITERATION":
                 break
             if item == "SOCKET_ERROR":
@@ -1855,11 +1986,14 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         with flow_lock:
             active_flows_count = max(0, active_flows_count - 1)
             prom_active_flows.set(active_flows_count)
-        if session:
-            try:
-                session.close()
-            except Exception:
-                pass
+        if session is not None:
+            if stream_pool_key is not None:
+                _release_stream_session(stream_pool_key, session, discard=_discard_stream_session or terminal_error)
+            else:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 # 根路径直达控制面板（无需 /dashboard 后缀）
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -2332,6 +2466,8 @@ async def chat_completions(raw_request: Request):
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
+        stream_pool_key = None
+        stream_borrowed = False
         proxies = None
         egress_key = "unknown"
         try:
@@ -2353,13 +2489,21 @@ async def chat_completions(raw_request: Request):
                 prom_requests_rate_limited.labels(model=current_model).inc()
                 category, _, _ = classify_upstream_429(response)
                 if category == "quota":
+                    if stream_borrowed:
+                        _release_stream_session(stream_pool_key, session, discard=True)
+                        stream_borrowed = False
                     return upstream_rate_limit_response(response, current_model)
-                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt):
+                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None):
+                    stream_borrowed = False
                     continue
+                if stream_borrowed:
+                    _release_stream_session(stream_pool_key, session, discard=True)
+                    stream_borrowed = False
                 return upstream_rate_limit_response(response, current_model)
 
             if response.status_code >= 500:
-                _reset_request_session("chat", session, pooled=not is_stream)
+                _reset_request_session("chat", session, pooled=not is_stream, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                stream_borrowed = False
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, current_model, delay)
                 await asyncio.sleep(delay)
@@ -2375,6 +2519,9 @@ async def chat_completions(raw_request: Request):
                         error_body = "".join(error_lines) if error_lines else "Unknown upstream error"
                     except Exception:
                         error_body = "Unknown upstream error"
+                    if stream_borrowed:
+                        _release_stream_session(stream_pool_key, session, discard=True)
+                        stream_borrowed = False
                     log.warning("Upstream error body for '%s': %s", current_model, error_body[:500])
                     error_chunk = {
                         "id": f"chatcmpl-{int(time.time())}",
@@ -2419,22 +2566,12 @@ async def chat_completions(raw_request: Request):
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
                     if current_model in RESPONSES_ONLY_MODELS:
-                        stream_gen = responses_stream_as_chat(response, current_model)
+                        stream_gen = responses_stream_as_chat(response, current_model, session=session if stream_borrowed else None, stream_pool_key=stream_pool_key if stream_borrowed else None)
                     else:
-                        stream_gen = stream_response(response, current_model, session=session)
-                    metrics["successful_requests"] += 1
-                    prom_requests_success.labels(model=current_model).inc()
-                    prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
+                        stream_gen = stream_response(response, current_model, session=session, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                    # 流式只记一条 history（播完才算成功）；token 先按估算记一次，
+                    # 真实 usage 由 responses 转换函数在 completion 事件里再记（幂等聚合）
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
-                    record_request_history(
-                        model=current_model,
-                        proxy_ip=_request_proxy_url(proxies) or "",
-                        egress_ip=egress_key,
-                        latency_ms=round((time.time() - start_time) * 1000, 1),
-                        status="ok",
-                        is_stream=is_stream,
-                        attempt=attempt,
-                    )
                     return StreamingResponse(
                         stream_gen,
                         media_type="text/event-stream",
@@ -2458,7 +2595,24 @@ async def chat_completions(raw_request: Request):
                             prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
                             completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
                         )
+                        record_request_history(
+                            model=current_model,
+                            proxy_ip=_request_proxy_url(proxies) or "",
+                            egress_ip=egress_key,
+                            latency_ms=round((time.time() - start_time) * 1000, 1),
+                            status="ok",
+                            is_stream=False,
+                            attempt=attempt,
+                        )
                         return JSONResponse(content=res_json)
+                    except EmptyStreamError:
+                        if stream_borrowed:
+                            _release_stream_session(stream_pool_key, session, discard=True)
+                            stream_borrowed = False
+                        log.warning("Empty forced stream for '%s'; retrying (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
+                        delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                        await asyncio.sleep(delay)
+                        continue
                     except Exception:
                         track_token_usage(current_model, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
                         return {
@@ -2476,9 +2630,8 @@ async def chat_completions(raw_request: Request):
                 _mark_request_proxy_failure(proxies)
             # 代理失败时清除 session 绑定，下次请求重新选代理
             if session_key:
-                with _session_proxy_map_lock:
-                    _session_proxy_map.pop(session_key, None)
-            _reset_request_session("chat", session, pooled=not is_stream)
+                _session_proxy_pop(session_key)
+            _reset_request_session("chat", session, pooled=not is_stream, stream_pool_key=stream_pool_key if stream_borrowed else None)
             consecutive_timeouts = consecutive_timeouts + 1 if transport_error else 0
             if consecutive_timeouts >= NETWORK_FAILURE_ROTATION_THRESHOLD and ROTATE_ON_429:
                 rotated, new_ip = await rotate_egress_safely(f"Consecutive transport failures x{consecutive_timeouts} (attempt {attempt})")
@@ -2548,21 +2701,27 @@ async def anthropic_messages(raw_request: Request):
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
+        stream_pool_key = None
+        stream_borrowed = False
         proxies = None
         egress_key = "unknown"
         try:
             proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
-            session = create_fresh_session(is_stream) if is_stream else _get_session("anthropic")
-            response = session.post(
-                TARGET_ZEN_ANTHROPIC_URL,
-                json=body,
-                headers=headers,
-                impersonate="chrome124",
-                stream=is_stream,
-                proxies=proxies,
-                timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT) if is_stream else 120,
-            )
+            if is_stream:
+                session, stream_pool_key, _ = _get_stream_session("anthropic", egress_key)
+                stream_borrowed = True
+                response = await _post_upstream_stream(
+                    session, TARGET_ZEN_ANTHROPIC_URL, json_body=body, headers=headers,
+                    proxies=proxies,
+                    timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT),
+                )
+            else:
+                session = _get_session("anthropic")
+                response = await _post_upstream(
+                    session, TARGET_ZEN_ANTHROPIC_URL, json_body=body, headers=headers,
+                    proxies=proxies, timeout=120,
+                )
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
             if response.status_code == 429:
@@ -2570,13 +2729,21 @@ async def anthropic_messages(raw_request: Request):
                 prom_requests_rate_limited.labels(model=model_name).inc()
                 category, _, _ = classify_upstream_429(response)
                 if category == "quota":
+                    if stream_borrowed:
+                        _release_stream_session(stream_pool_key, session, discard=True)
+                        stream_borrowed = False
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt):
+                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None):
+                    stream_borrowed = False
                     continue
+                if stream_borrowed:
+                    _release_stream_session(stream_pool_key, session, discard=True)
+                    stream_borrowed = False
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
-                _reset_request_session("anthropic", session, pooled=not is_stream)
+                _reset_request_session("anthropic", session, pooled=not is_stream, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                stream_borrowed = False
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
@@ -2590,7 +2757,7 @@ async def anthropic_messages(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name, session=session, protocol="anthropic"),
+                    stream_response(response, model_name, session=session, protocol="anthropic", stream_pool_key=stream_pool_key if stream_borrowed else None),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -2616,9 +2783,8 @@ async def anthropic_messages(raw_request: Request):
                 _mark_request_proxy_failure(proxies)
             # 代理失败时清除 session 绑定，下次请求重新选代理
             if session_key:
-                with _session_proxy_map_lock:
-                    _session_proxy_map.pop(session_key, None)
-            _reset_request_session("anthropic", session, pooled=not is_stream)
+                _session_proxy_pop(session_key)
+            _reset_request_session("anthropic", session, pooled=not is_stream, stream_pool_key=stream_pool_key if stream_borrowed else None)
             consecutive_timeouts = consecutive_timeouts + 1 if transport_error else 0
             if consecutive_timeouts >= NETWORK_FAILURE_ROTATION_THRESHOLD and ROTATE_ON_429:
                 rotated, new_ip = await rotate_egress_safely(f"Consecutive transport failures x{consecutive_timeouts} (attempt {attempt})")
@@ -2666,6 +2832,8 @@ async def responses_endpoint(raw_request: Request):
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
+        stream_pool_key = None
+        stream_borrowed = False
         proxies = None
         egress_key = "unknown"
         try:
@@ -2687,13 +2855,21 @@ async def responses_endpoint(raw_request: Request):
                 prom_requests_rate_limited.labels(model=model_name).inc()
                 category, _, _ = classify_upstream_429(response)
                 if category == "quota":
+                    if stream_borrowed:
+                        _release_stream_session(stream_pool_key, session, discard=True)
+                        stream_borrowed = False
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt):
+                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None):
+                    stream_borrowed = False
                     continue
+                if stream_borrowed:
+                    _release_stream_session(stream_pool_key, session, discard=True)
+                    stream_borrowed = False
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
-                _reset_request_session("responses", session, pooled=not is_stream)
+                _reset_request_session("responses", session, pooled=not is_stream, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                stream_borrowed = False
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
@@ -2707,7 +2883,7 @@ async def responses_endpoint(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name, session=session, protocol="responses"),
+                    stream_response(response, model_name, session=session, protocol="responses", stream_pool_key=stream_pool_key if stream_borrowed else None),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -2726,9 +2902,8 @@ async def responses_endpoint(raw_request: Request):
                 _mark_request_proxy_failure(proxies)
             # 代理失败时清除 session 绑定，下次请求重新选代理
             if session_key:
-                with _session_proxy_map_lock:
-                    _session_proxy_map.pop(session_key, None)
-            _reset_request_session("responses", session, pooled=not is_stream)
+                _session_proxy_pop(session_key)
+            _reset_request_session("responses", session, pooled=not is_stream, stream_pool_key=stream_pool_key if stream_borrowed else None)
             consecutive_timeouts = consecutive_timeouts + 1 if transport_error else 0
             if consecutive_timeouts >= NETWORK_FAILURE_ROTATION_THRESHOLD and ROTATE_ON_429:
                 rotated, new_ip = await rotate_egress_safely(f"Consecutive transport failures x{consecutive_timeouts} (attempt {attempt})")
