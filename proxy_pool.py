@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -20,24 +21,72 @@ EGRESS_STATE_FILE = Path(os.environ.get("EGRESS_STATE_FILE", "/app/data/egress_s
 PROXY_COOLDOWN_BASE = int(os.environ.get("PROXY_COOLDOWN_BASE", "60"))
 PROXY_COOLDOWN_FACTOR = int(os.environ.get("PROXY_COOLDOWN_FACTOR", "30"))
 PROXY_LATENCY_THRESHOLD_MS = int(os.environ.get("PROXY_LATENCY_THRESHOLD_MS", "300"))
+# 选路文件读缓存（秒）：proxies.txt/proxy_state.json/egress_state.json 按 mtime 失效。
+# 三个进程共享 ./data 卷，但这些文件由面板/轮换低频写，热路径读缓存 1s 足够；
+# 写路径每次清缓存，保证切换出口后最多 1s 可见。
+PROXY_FILE_CACHE_TTL = max(0.2, float(os.environ.get("PROXY_FILE_CACHE_TTL", "1.0")))
+_file_cache: Dict[str, tuple] = {}
+_file_cache_lock = threading.Lock()
+
+
+def _cached_file(path: Path):
+    now = time.monotonic()
+    key = str(path)
+    with _file_cache_lock:
+        entry = _file_cache.get(key)
+        if entry is not None and (now - entry[0]) < PROXY_FILE_CACHE_TTL:
+            return entry[2], True
+    try:
+        mtime = path.stat().st_mtime if path.exists() else -1.0
+    except Exception:
+        mtime = -1.0
+    with _file_cache_lock:
+        entry = _file_cache.get(key)
+        if entry is not None and entry[1] == mtime and (now - entry[0]) < PROXY_FILE_CACHE_TTL * 10:
+            # 文件未变：缓存值依然有效，刷新时间戳避免每个请求都 stat
+            _file_cache[key] = (now, entry[1], entry[2])
+            return entry[2], True
+    return (mtime, now, None), False
+
+
+def _store_file_cache(path: Path, meta, value) -> None:
+    with _file_cache_lock:
+        _file_cache[str(path)] = (meta[1], meta[0], value)
+
+
+def _invalidate_file_cache(path: Path) -> None:
+    with _file_cache_lock:
+        _file_cache.pop(str(path), None)
 
 
 def read_proxy_list() -> List[str]:
+    cached, hit = _cached_file(PROXY_LIST_FILE)
+    if hit:
+        return list(cached) if isinstance(cached, list) else []
+    meta = cached
     if not PROXY_LIST_FILE.exists():
+        _store_file_cache(PROXY_LIST_FILE, meta, [])
         return []
     try:
         with PROXY_LIST_FILE.open("r", encoding="utf-8") as handle:
             values = [normalize_proxy_url(line) for line in handle if line.strip() and not line.lstrip().startswith("#")]
-        return list(dict.fromkeys(value for value in values if value))
+        result = list(dict.fromkeys(value for value in values if value))
+        _store_file_cache(PROXY_LIST_FILE, meta, result)
+        return list(result)
     except Exception:
         return []
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    cached, hit = _cached_file(path)
+    if hit:
+        return cached if isinstance(cached, (dict, list)) else default
+    meta = cached
     try:
         if path.exists():
             with path.open("r", encoding="utf-8") as handle:
                 value = json.load(handle)
+            _store_file_cache(path, meta, value)
             return value
     except Exception:
         pass
@@ -51,6 +100,7 @@ def _write_json(path: Path, value: Any) -> bool:
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
         temp.replace(path)
+        _invalidate_file_cache(path)
         return True
     except Exception:
         return False
@@ -238,6 +288,10 @@ def mark_proxy_success(proxy: Optional[str]) -> None:
         return
     proxy = normalize_proxy_url(proxy)
     state = read_proxy_state()
+    entry = state.get(proxy)
+    # 已是干净状态就跳过写盘：原来每次成功请求都全量重写 proxy_state.json
+    if isinstance(entry, dict) and entry.get("status") == "ok" and not entry.get("fail_count") and "cooldown_until" not in entry:
+        return
     entry = state.setdefault(proxy, {})
     if not isinstance(entry, dict):
         entry = {}
