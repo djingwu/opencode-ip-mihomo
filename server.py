@@ -1068,7 +1068,136 @@ def _convert_tool_choice_to_responses_format(tool_choice):
     return "auto"
 
 
-async def responses_stream_as_chat(response, model_name: str):
+# --- free-tier agentic shim -------------------------------------------------
+# 上游免费层要求请求"像真客户端"（responses 路径实测规则）：
+#   stream=true 且 tools>=2 且含 bash，否则 403 FreeTierError。
+# 代理对免费模型（*-free）自动补最小 tools；下游非流请求则强制走上游流式，
+# 播完拼回下游要的 JSON，保证下游契约不变。
+FREE_TIER_SHIM_ENABLED = os.environ.get("FREE_TIER_SHIM_ENABLED", "true").lower() in ("true", "1", "yes")
+
+def is_free_tier_model(name) -> bool:
+    return bool(name) and str(name).endswith("-free")
+
+
+def _shim_tool_responses(name: str) -> dict:
+    return {
+        "type": "function", "name": name, "description": "x",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "strict": False,
+    }
+
+
+def _shim_tool_chat(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name, "description": "x",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+
+
+def _resp_tool_names(tools) -> set:
+    names = set()
+    for t in tools or []:
+        if isinstance(t, dict):
+            n = t.get("name")
+            if not n:
+                fn = t.get("function")
+                if isinstance(fn, dict):
+                    n = fn.get("name")
+            if n:
+                names.add(n)
+    return names
+
+
+def ensure_free_tier_tools_responses(body: dict) -> dict:
+    if not FREE_TIER_SHIM_ENABLED or not isinstance(body, dict):
+        return body
+    if not is_free_tier_model(body.get("model")):
+        return body
+    tools = body.get("tools")
+    tools = list(tools) if isinstance(tools, list) else []
+    have = _resp_tool_names(tools)
+    if "bash" not in have:
+        tools.append(_shim_tool_responses("bash"))
+        have.add("bash")
+    if len(tools) < 2:
+        tools.append(_shim_tool_responses("read"))
+    if tools != body.get("tools"):
+        log.debug("Free-tier shim injected tools for model '%s'.", body.get("model"))
+    body["tools"] = tools
+    return body
+
+
+def ensure_free_tier_tools_chat(payload: dict) -> dict:
+    if not FREE_TIER_SHIM_ENABLED or not isinstance(payload, dict):
+        return payload
+    if not is_free_tier_model(payload.get("model")):
+        return payload
+    tools = payload.get("tools")
+    tools = list(tools) if isinstance(tools, list) else []
+    have = _resp_tool_names(tools)
+    if "bash" not in have:
+        tools.append(_shim_tool_chat("bash"))
+    if len(tools) < 2:
+        tools.append(_shim_tool_chat("read"))
+    if tools != payload.get("tools"):
+        log.debug("Free-tier shim injected chat tools for model '%s'.", payload.get("model"))
+    payload["tools"] = tools
+    return payload
+
+
+def _collect_responses_stream_blocking(response):
+    """阻塞读完上游 responses SSE，返回 completed 的 response 对象。"""
+    latest = None
+    texts = []
+    try:
+        lines = list(response.iter_lines())
+    except Exception as exc:
+        raise EmptyStreamError(f"stream read failed: {exc}")
+    for item in lines:
+        if not item:
+            continue
+        try:
+            raw = item.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if not raw.startswith("data:"):
+            continue
+        data_str = raw[5:].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        r = data.get("response")
+        if isinstance(r, dict):
+            latest = r
+        etype = data.get("type", "")
+        if etype == "response.output_text.delta":
+            d = data.get("delta")
+            if isinstance(d, str):
+                texts.append(d)
+        if etype == "response.completed":
+            if isinstance(latest, dict):
+                return latest
+            break
+    if isinstance(latest, dict):
+        return latest
+    if texts:
+        return {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "".join(texts)}]}]}
+    raise EmptyStreamError("Upstream returned empty response stream")
+
+
+async def _collect_responses_stream(response):
+    return await asyncio.to_thread(_collect_responses_stream_blocking, response)
+
+
+async def responses_stream_as_chat(response, model_name: str, session=None, stream_pool_key=None):
     """将 Responses API 的流式 SSE 事件转为 Chat Completions SSE 格式。"""
     loop = asyncio.get_event_loop()
     pending_sse_event = ""
@@ -2515,6 +2644,18 @@ async def chat_completions(raw_request: Request):
             payload.pop(key, None)
         _target_url = TARGET_ZEN_RESPONSES_URL
 
+    # 免费层伪装：responses 形态补 responses-tools，否则补 chat-tools；
+    # responses-only 免费模型的非流请求强制走上游流式再拼回 JSON。
+    if current_model in RESPONSES_ONLY_MODELS:
+        payload = ensure_free_tier_tools_responses(payload)
+    else:
+        payload = ensure_free_tier_tools_chat(payload)
+    force_upstream_stream = (
+        (not is_stream) and FREE_TIER_SHIM_ENABLED
+        and is_free_tier_model(current_model)
+        and (current_model in RESPONSES_ONLY_MODELS)
+    )
+
     client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
     headers = get_realistic_headers(client_key)
     for k, v in raw_request.headers.items():
@@ -2535,16 +2676,24 @@ async def chat_completions(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
-            session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
-            response = session.post(
-                _target_url,
-                json=payload,
-                headers=headers,
-                impersonate="chrome124",
-                stream=is_stream,
-                proxies=proxies,
-                timeout=MODEL_TIMEOUT_OVERRIDES.get(current_model, STREAM_TIMEOUT) if is_stream else 120
-            )
+            upstream_payload = payload
+            if force_upstream_stream:
+                upstream_payload = dict(payload)
+                upstream_payload["stream"] = True
+            if is_stream or force_upstream_stream:
+                session, stream_pool_key, _ = _get_stream_session("chat", egress_key)
+                stream_borrowed = True
+                response = await _post_upstream_stream(
+                    session, _target_url, json_body=upstream_payload, headers=headers,
+                    proxies=proxies,
+                    timeout=MODEL_TIMEOUT_OVERRIDES.get(current_model, STREAM_TIMEOUT),
+                )
+            else:
+                session = _get_session("chat")
+                response = await _post_upstream(
+                    session, _target_url, json_body=payload, headers=headers,
+                    proxies=proxies, timeout=120,
+                )
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
@@ -2647,7 +2796,12 @@ async def chat_completions(raw_request: Request):
             else:
                 with FlowContext():
                     try:
-                        res_json = await asyncio.to_thread(response.json)
+                        if force_upstream_stream:
+                            res_json = await _collect_responses_stream(response)
+                            _release_stream_session(stream_pool_key, session, discard=False)
+                            stream_borrowed = False
+                        else:
+                            res_json = await asyncio.to_thread(response.json)
                         # Responses-only 模型：将 Responses API 响应转为 Chat Completions 格式
                         if current_model in RESPONSES_ONLY_MODELS:
                             res_json = _convert_responses_to_chat(res_json, current_model)
@@ -2888,6 +3042,11 @@ async def responses_endpoint(raw_request: Request):
     for k, v in raw_request.headers.items():
         if k.lower().startswith("x-opencode-"):
             headers[k] = v
+    headers = apply_downstream_auth(headers, raw_request)
+    body = ensure_free_tier_tools_responses(body)
+    force_upstream_stream = (
+        (not is_stream) and FREE_TIER_SHIM_ENABLED and is_free_tier_model(model_name)
+    )
 
     # 会话标识：优先用客户端传入的 x-opencode-session
     session_key = headers.get("x-opencode-session", "") or client_key
@@ -2902,16 +3061,24 @@ async def responses_endpoint(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
-            session = create_fresh_session(is_stream) if is_stream else _get_session("responses")
-            response = session.post(
-                TARGET_ZEN_RESPONSES_URL,
-                json=body,
-                headers=headers,
-                impersonate="chrome124",
-                stream=is_stream,
-                proxies=proxies,
-                timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT) if is_stream else 120,
-            )
+            upstream_body = body
+            if force_upstream_stream:
+                upstream_body = dict(body)
+                upstream_body["stream"] = True
+            if is_stream or force_upstream_stream:
+                session, stream_pool_key, _ = _get_stream_session("responses", egress_key)
+                stream_borrowed = True
+                response = await _post_upstream_stream(
+                    session, TARGET_ZEN_RESPONSES_URL, json_body=upstream_body, headers=headers,
+                    proxies=proxies,
+                    timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT),
+                )
+            else:
+                session = _get_session("responses")
+                response = await _post_upstream(
+                    session, TARGET_ZEN_RESPONSES_URL, json_body=body, headers=headers,
+                    proxies=proxies, timeout=120,
+                )
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
@@ -2953,8 +3120,20 @@ async def responses_endpoint(raw_request: Request):
             else:
                 with FlowContext():
                     try:
-                        res_json = await asyncio.to_thread(response.json)
+                        if force_upstream_stream:
+                            res_json = await _collect_responses_stream(response)
+                            _release_stream_session(stream_pool_key, session, discard=False)
+                            stream_borrowed = False
+                        else:
+                            res_json = await asyncio.to_thread(response.json)
                         return JSONResponse(content=res_json)
+                    except EmptyStreamError:
+                        if stream_borrowed:
+                            _release_stream_session(stream_pool_key, session, discard=True)
+                            stream_borrowed = False
+                        delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                        await asyncio.sleep(delay)
+                        continue
                     except Exception:
                         return JSONResponse(content=response.text)
 
