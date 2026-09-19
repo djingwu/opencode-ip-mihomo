@@ -9,6 +9,7 @@ import threading
 import time
 import secrets
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
@@ -911,6 +912,9 @@ METRICS_FLUSH_MAX_ROWS = max(10, int(os.environ.get("METRICS_FLUSH_MAX_ROWS", "2
 REQUEST_HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("REQUEST_HISTORY_RETENTION_DAYS", "7")))
 REQUEST_HISTORY_MAX_ROWS = max(1000, int(os.environ.get("REQUEST_HISTORY_MAX_ROWS", "10000")))
 RATE_LIMIT_ROTATION_THRESHOLD = max(1, int(os.environ.get("RATE_LIMIT_ROTATION_THRESHOLD", "2")))
+# key 级长封禁阈值（秒）：retry-after 超过它说明不是 IP 级瞬时限流，
+# 换出口也无用，直接快速失败并把 Retry-After 透给下游退避。
+LONG_BAN_THRESHOLD_SECONDS = max(30, int(os.environ.get("LONG_BAN_THRESHOLD_SECONDS", "120")))
 MAX_RATE_LIMIT_WAIT = max(0.0, float(os.environ.get("MAX_RATE_LIMIT_WAIT", "8")))
 NETWORK_FAILURE_ROTATION_THRESHOLD = max(1, int(os.environ.get("NETWORK_FAILURE_ROTATION_THRESHOLD", "2")))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
@@ -1793,6 +1797,15 @@ async def recover_from_rate_limit(
     category, retry_after, _ = classify_upstream_429(response)
     if category == "quota":
         return False
+    if retry_after is not None and retry_after > LONG_BAN_THRESHOLD_SECONDS:
+        # key/账号级长封禁（如 retry-after 数小时）：换出口无用，不重试不轮换，
+        # 直接返回 False 让调用方把 429 + Retry-After 透给下游退避。
+        log.warning(
+            "Long upstream ban for '%s' (retry_after=%ss > %ss); "
+            "skipping retry and egress rotation.",
+            model_name, retry_after, LONG_BAN_THRESHOLD_SECONDS,
+        )
+        return False
 
     streak, rotate_now = _egress_rate_policy.record_rate_limit(egress_key)
     if not rotate_now:
@@ -1913,6 +1926,8 @@ async def stream_response(response, model_name: str, session=None, protocol: str
     global active_flows_count
     is_responses_api = protocol == "responses"
     is_anthropic_api = protocol == "anthropic"
+    # 正常播完才归还 keepalive；中途断开/异常则丢弃，避免脏连接污染池
+    _discard_stream_session = False
 
     with flow_lock:
         active_flows_count += 1
@@ -2164,6 +2179,7 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             model_name, chunk_count,
         )
     except Exception as exc:
+        _discard_stream_session = True
         log.error("Stream exception for '%s': %s: %s", model_name, type(exc).__name__, exc, exc_info=True)
         if is_anthropic_api:
             yield b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_error\",\"message\":\"Upstream stream interrupted\"}}\n\n"
