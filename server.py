@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import sqlite3
 import threading
@@ -1073,19 +1074,22 @@ def _convert_tool_choice_to_responses_format(tool_choice):
 
 
 # --- free-tier agentic shim -------------------------------------------------
-# 上游免费层要求请求"像真客户端"（responses 路径实测规则）：
-#   stream=true 且 tools>=2 且含 bash，否则 403 FreeTierError。
-# 代理对免费模型（*-free）自动补最小 tools；下游非流请求则强制走上游流式，
-# 播完拼回下游要的 JSON，保证下游契约不变。
+# 上游免费层要求请求"像真客户端"：
+#   stream=true 且含核心 agent 工具（bash, edit, glob, grep, read），否则 403 FreeTierError。
+# 代理对免费模型自动补核心 tools；下游非流请求则强制走上游流式，
+# 播完聚合拼回下游要的 JSON（stream collapse），保证下游契约不变。
 FREE_TIER_SHIM_ENABLED = os.environ.get("FREE_TIER_SHIM_ENABLED", "true").lower() in ("true", "1", "yes")
 
 def is_free_tier_model(name) -> bool:
-    return bool(name) and str(name).endswith("-free")
+    return bool(name) and "free" in str(name).lower()
+
+
+CORE_AGENT_TOOLS = ["bash", "edit", "glob", "grep", "read"]
 
 
 def _shim_tool_responses(name: str) -> dict:
     return {
-        "type": "function", "name": name, "description": "x",
+        "type": "function", "name": name, "description": f"Agent tool {name}",
         "parameters": {"type": "object", "properties": {}, "required": []},
         "strict": False,
     }
@@ -1095,9 +1099,17 @@ def _shim_tool_chat(name: str) -> dict:
     return {
         "type": "function",
         "function": {
-            "name": name, "description": "x",
+            "name": name, "description": f"Agent tool {name}",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
+    }
+
+
+def _shim_tool_anthropic(name: str) -> dict:
+    return {
+        "name": name,
+        "description": f"Agent tool {name}",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     }
 
 
@@ -1123,12 +1135,13 @@ def ensure_free_tier_tools_responses(body: dict) -> dict:
     tools = body.get("tools")
     tools = list(tools) if isinstance(tools, list) else []
     have = _resp_tool_names(tools)
-    if "bash" not in have:
-        tools.append(_shim_tool_responses("bash"))
-        have.add("bash")
-    if len(tools) < 2:
-        tools.append(_shim_tool_responses("read"))
-    if tools != body.get("tools"):
+    changed = False
+    for name in CORE_AGENT_TOOLS:
+        if name not in have:
+            tools.append(_shim_tool_responses(name))
+            have.add(name)
+            changed = True
+    if changed:
         log.debug("Free-tier shim injected tools for model '%s'.", body.get("model"))
     body["tools"] = tools
     return body
@@ -1142,14 +1155,44 @@ def ensure_free_tier_tools_chat(payload: dict) -> dict:
     tools = payload.get("tools")
     tools = list(tools) if isinstance(tools, list) else []
     have = _resp_tool_names(tools)
-    if "bash" not in have:
-        tools.append(_shim_tool_chat("bash"))
-    if len(tools) < 2:
-        tools.append(_shim_tool_chat("read"))
-    if tools != payload.get("tools"):
+    changed = False
+    for name in CORE_AGENT_TOOLS:
+        if name not in have:
+            tools.append(_shim_tool_chat(name))
+            have.add(name)
+            changed = True
+    if changed:
         log.debug("Free-tier shim injected chat tools for model '%s'.", payload.get("model"))
     payload["tools"] = tools
+    options = payload.get("stream_options")
+    if not isinstance(options, dict):
+        payload["stream_options"] = {"include_usage": True}
+    elif not options.get("include_usage"):
+        options["include_usage"] = True
     return payload
+
+
+def ensure_free_tier_tools_anthropic(body: dict) -> dict:
+    if not FREE_TIER_SHIM_ENABLED or not isinstance(body, dict):
+        return body
+    if not is_free_tier_model(body.get("model")):
+        return body
+    tools = body.get("tools")
+    tools = list(tools) if isinstance(tools, list) else []
+    have = set()
+    for t in tools:
+        if isinstance(t, dict) and t.get("name"):
+            have.add(t.get("name"))
+    changed = False
+    for name in CORE_AGENT_TOOLS:
+        if name not in have:
+            tools.append(_shim_tool_anthropic(name))
+            have.add(name)
+            changed = True
+    if changed:
+        log.debug("Free-tier shim injected anthropic tools for model '%s'.", body.get("model"))
+    body["tools"] = tools
+    return body
 
 
 def _collect_responses_stream_blocking(response):
@@ -1199,6 +1242,214 @@ def _collect_responses_stream_blocking(response):
 
 async def _collect_responses_stream(response):
     return await asyncio.to_thread(_collect_responses_stream_blocking, response)
+
+
+def _collect_chat_stream_blocking(response, model_name: str):
+    """阻塞读完上游 Chat Completions SSE，聚合还原为单条 JSON 响应。"""
+    msg_id = None
+    created = int(time.time())
+    role = "assistant"
+    content_parts = []
+    reasoning_parts = []
+    tool_calls_dict = {}
+    finish_reason = "stop"
+    usage = {}
+
+    try:
+        lines = list(response.iter_lines())
+    except Exception as exc:
+        raise EmptyStreamError(f"stream read failed: {exc}")
+
+    for item in lines:
+        if not item:
+            continue
+        try:
+            raw = item.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if not raw.startswith("data:"):
+            continue
+        data_str = raw[5:].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        if not msg_id and data.get("id"):
+            msg_id = data.get("id")
+        if data.get("created"):
+            created = data.get("created")
+        if data.get("usage"):
+            usage = data.get("usage")
+
+        choices = data.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice.get("finish_reason")
+        delta = choice.get("delta") or {}
+        if delta.get("role"):
+            role = delta.get("role")
+        if delta.get("content"):
+            content_parts.append(delta.get("content"))
+        if delta.get("reasoning"):
+            reasoning_parts.append(delta.get("reasoning"))
+
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            if idx not in tool_calls_dict:
+                tool_calls_dict[idx] = {
+                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:20]}",
+                    "type": tc.get("type") or "function",
+                    "function": {
+                        "name": tc.get("function", {}).get("name", "") if tc.get("function") else "",
+                        "arguments": tc.get("function", {}).get("arguments", "") if tc.get("function") else "",
+                    }
+                }
+            else:
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    tool_calls_dict[idx]["function"]["name"] = fn.get("name")
+                if fn.get("arguments"):
+                    tool_calls_dict[idx]["function"]["arguments"] += fn.get("arguments")
+
+    content = "".join(content_parts) if content_parts else ""
+    reasoning = "".join(reasoning_parts) if reasoning_parts else None
+
+    message = {"role": role, "content": content}
+    if reasoning:
+        message["reasoning"] = reasoning
+    if tool_calls_dict:
+        sorted_calls = [tool_calls_dict[k] for k in sorted(tool_calls_dict.keys())]
+        message["tool_calls"] = sorted_calls
+        if finish_reason == "stop":
+            finish_reason = "tool_calls"
+
+    if not content and not reasoning and not tool_calls_dict:
+        raise EmptyStreamError("Upstream returned empty chat stream")
+
+    res = {
+        "id": msg_id or f"chatcmpl-{uuid.uuid4().hex[:20]}",
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+    }
+    if usage:
+        res["usage"] = usage
+    else:
+        res["usage"] = {
+            "prompt_tokens": DEFAULT_PROMPT_TOKENS,
+            "completion_tokens": DEFAULT_COMPLETION_TOKENS,
+            "total_tokens": DEFAULT_PROMPT_TOKENS + DEFAULT_COMPLETION_TOKENS
+        }
+    return res
+
+
+async def _collect_chat_stream(response, model_name: str):
+    return await asyncio.to_thread(_collect_chat_stream_blocking, response, model_name)
+
+
+def _collect_anthropic_stream_blocking(response, model_name: str):
+    """阻塞读完上游 Anthropic SSE，聚合还原为单条 JSON 响应。"""
+    msg_id = None
+    role = "assistant"
+    content_blocks = []
+    stop_reason = "end_turn"
+    stop_sequence = None
+    usage = {"input_tokens": 0, "output_tokens": 0}
+
+    try:
+        lines = list(response.iter_lines())
+    except Exception as exc:
+        raise EmptyStreamError(f"stream read failed: {exc}")
+
+    current_event = None
+    curr_block = None
+
+    for item in lines:
+        if not item:
+            continue
+        try:
+            raw = item.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if raw.startswith("event:"):
+            current_event = raw[6:].strip()
+            continue
+        if not raw.startswith("data:"):
+            continue
+        data_str = raw[5:].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        etype = current_event or data.get("type", "")
+
+        if etype == "message_start":
+            msg = data.get("message") or {}
+            msg_id = msg.get("id") or msg_id
+            if msg.get("usage"):
+                usage.update(msg.get("usage"))
+        elif etype == "content_block_start":
+            block = data.get("content_block") or {}
+            curr_block = dict(block)
+            content_blocks.append(curr_block)
+        elif etype == "content_block_delta":
+            delta = data.get("delta") or {}
+            dtype = delta.get("type")
+            if curr_block is not None:
+                if dtype == "text_delta":
+                    curr_block["text"] = curr_block.get("text", "") + delta.get("text", "")
+                elif dtype == "input_json_delta":
+                    curr_block["partial_json"] = curr_block.get("partial_json", "") + delta.get("partial_json", "")
+        elif etype == "content_block_stop":
+            if curr_block and "partial_json" in curr_block:
+                try:
+                    curr_block["input"] = json.loads(curr_block.pop("partial_json"))
+                except Exception:
+                    curr_block["input"] = {}
+            curr_block = None
+        elif etype == "message_delta":
+            delta = data.get("delta") or {}
+            if delta.get("stop_reason"):
+                stop_reason = delta.get("stop_reason")
+            if delta.get("stop_sequence"):
+                stop_sequence = delta.get("stop_sequence")
+            if data.get("usage"):
+                usage.update(data.get("usage"))
+
+    if not content_blocks:
+        raise EmptyStreamError("Upstream returned empty anthropic stream")
+
+    return {
+        "id": msg_id or f"msg-{uuid.uuid4().hex[:20]}",
+        "type": "message",
+        "role": role,
+        "content": content_blocks,
+        "model": model_name,
+        "stop_reason": stop_reason,
+        "stop_sequence": stop_sequence,
+        "usage": usage,
+    }
+
+
+async def _collect_anthropic_stream(response, model_name: str):
+    return await asyncio.to_thread(_collect_anthropic_stream_blocking, response, model_name)
 
 
 async def responses_stream_as_chat(response, model_name: str, session=None, stream_pool_key=None):
@@ -1538,7 +1789,7 @@ def discover_models_task():
                     
                     if new_models:
                         # 过滤掉已知不可用的模型
-                        unavailable = {"deepseek-v4-flash-free", "hy3-free", "laguna-s-2.1-free"}
+                        unavailable = {"deepseek-v4-flash-free", "hy3-free", "laguna-s-2.1-free", "jev-1.13-free"}
                         new_models = [m for m in new_models if m["id"] not in unavailable]
                         if new_models:
                             with _discovery_lock:
@@ -1630,7 +1881,11 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
                 _session_cache[client_key] = _random_opencode_id("ses", descending=True)
             session = _session_cache[client_key]
     else:
-        session = os.environ.get("OPENCODE_SESSION", "dsh-opencode-go-session")
+        env_ses = os.environ.get("OPENCODE_SESSION", "")
+        if env_ses and re.match(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$", env_ses):
+            session = env_ses
+        else:
+            session = _random_opencode_id("ses", descending=True)
     return {
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
@@ -1641,7 +1896,9 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
         "x-opencode-request": _random_opencode_id("msg", descending=False),
         # 同一 client_key 复用同一 session：原来每次随机，亲和失效 + map 堆垃圾。
         # 无 key 匿名请求保持每次随机（无法区分客户端，随机反而能分散代理）。
-        "x-opencode-session": session if client_key else _random_opencode_id("ses", descending=True),
+        "x-opencode-session": session,
+        "x-session-affinity": session,
+        "X-Session-Id": session,
     }
 
 
@@ -2669,7 +2926,6 @@ async def chat_completions(raw_request: Request):
     force_upstream_stream = (
         (not is_stream) and FREE_TIER_SHIM_ENABLED
         and is_free_tier_model(current_model)
-        and (current_model in RESPONSES_ONLY_MODELS)
     )
 
     client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
@@ -2830,7 +3086,10 @@ async def chat_completions(raw_request: Request):
                 with FlowContext():
                     try:
                         if force_upstream_stream:
-                            res_json = await _collect_responses_stream(response)
+                            if current_model in RESPONSES_ONLY_MODELS:
+                                res_json = await _collect_responses_stream(response)
+                            else:
+                                res_json = await _collect_chat_stream(response, current_model)
                             _release_stream_session(stream_pool_key, session, discard=False)
                             stream_borrowed = False
                         else:
@@ -2930,6 +3189,12 @@ async def anthropic_messages(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
 
+    body = ensure_free_tier_tools_anthropic(body)
+    force_upstream_stream = (
+        (not is_stream) and FREE_TIER_SHIM_ENABLED
+        and is_free_tier_model(model_name)
+    )
+
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
         auth = raw_request.headers.get("authorization", "")
@@ -2958,11 +3223,15 @@ async def anthropic_messages(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy(session_key=session_key)
             egress_key = await pace_egress_request(proxies)
-            if is_stream:
+            upstream_body = body
+            if force_upstream_stream:
+                upstream_body = dict(body)
+                upstream_body["stream"] = True
+            if is_stream or force_upstream_stream:
                 session, stream_pool_key, _ = _get_stream_session("anthropic", egress_key)
                 stream_borrowed = True
                 response = await _post_upstream_stream(
-                    session, TARGET_ZEN_ANTHROPIC_URL, json_body=body, headers=headers,
+                    session, TARGET_ZEN_ANTHROPIC_URL, json_body=upstream_body, headers=headers,
                     proxies=proxies,
                     timeout=MODEL_TIMEOUT_OVERRIDES.get(model_name, STREAM_TIMEOUT),
                 )
@@ -3014,7 +3283,12 @@ async def anthropic_messages(raw_request: Request):
             else:
                 with FlowContext():
                     try:
-                        res_json = await asyncio.to_thread(response.json)
+                        if force_upstream_stream:
+                            res_json = await _collect_anthropic_stream(response, model_name)
+                            _release_stream_session(stream_pool_key, session, discard=False)
+                            stream_borrowed = False
+                        else:
+                            res_json = await asyncio.to_thread(response.json)
                         usage = res_json.get("usage", {})
                         track_token_usage(
                             model_name,
@@ -3022,6 +3296,14 @@ async def anthropic_messages(raw_request: Request):
                             completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
                         )
                         return JSONResponse(content=res_json)
+                    except EmptyStreamError:
+                        if stream_borrowed:
+                            _release_stream_session(stream_pool_key, session, discard=True)
+                            stream_borrowed = False
+                        log.warning("Empty forced anthropic stream for '%s'; retrying (%s/%s).", model_name, attempt, MAX_RETRIES_ON_429)
+                        delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                        await asyncio.sleep(delay)
+                        continue
                     except Exception:
                         track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
                         return JSONResponse(content=response.text)
