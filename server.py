@@ -2738,6 +2738,23 @@ async def chat_completions(raw_request: Request):
 
             # 处理 400/403 等客户端错误——上游拒绝了请求，不应标记成功
             if response.status_code >= 400:
+                if (response.status_code == 403 and FREE_TIER_SHIM_ENABLED
+                        and is_free_tier_model(current_model)
+                        and attempt < MAX_RETRIES_ON_429):
+                    # 免费层偶发 403（边缘执行差异，约 10%）：同出口重试一次，
+                    # 不轮换（换 IP 对 key 级校验无用）。仍失败则按原逻辑返回。
+                    if stream_borrowed:
+                        _release_stream_session(stream_pool_key, session, discard=True)
+                        stream_borrowed = False
+                    else:
+                        _reset_request_session("chat", session, pooled=not is_stream)
+                    log.warning(
+                        "Transient upstream 403 for '%s'; retrying same egress (%s/%s).",
+                        current_model, attempt, MAX_RETRIES_ON_429,
+                    )
+                    delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                    await asyncio.sleep(delay)
+                    continue
                 log.warning("Upstream HTTP %s for '%s'; returning error to client.", response.status_code, current_model)
                 if is_stream:
                     # 流式请求：读取错误响应体，返回 SSE 格式的错误
