@@ -1907,8 +1907,11 @@ UPSTREAM_API_KEY_OVERRIDE = os.environ.get("UPSTREAM_API_KEY", "").strip()
 
 def apply_downstream_auth(headers, raw_request):
     try:
-        # 服务端强制替换：下游 key 不可信时一律用配置的有效 key 上游。
-        if UPSTREAM_API_KEY_OVERRIDE and UPSTREAM_API_KEY_OVERRIDE.lower() != "public":
+        # 服务端强制替换：配置了 UPSTREAM_API_KEY 时（包括 public 匿名模式），一律用配置的值上游
+        if UPSTREAM_API_KEY_OVERRIDE:
+            if UPSTREAM_API_KEY_OVERRIDE.lower() == "public":
+                headers["Authorization"] = "Bearer public"
+                return headers
             _k = UPSTREAM_API_KEY_OVERRIDE
             headers["Authorization"] = _k if _k.lower().startswith("bearer ") else "Bearer " + _k
             return headers
