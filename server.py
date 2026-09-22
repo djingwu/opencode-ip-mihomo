@@ -1938,6 +1938,22 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
     }
 
 
+def _freshen_upstream_session(headers: Dict[str, str]) -> str:
+    """Generate a fresh upstream session/request ID pair.
+
+    Used for anonymous 403 recovery: upstream appears to pin (session → backend)
+    affinity, so retrying with the same ses_ ID can hit the same strict backend.
+    Only the in-flight request's headers are mutated; the per-client cached
+    session is untouched.
+    """
+    session = _random_opencode_id("ses", descending=True)
+    headers["x-opencode-session"] = session
+    headers["x-session-affinity"] = session
+    headers["X-Session-Id"] = session
+    headers["x-opencode-request"] = _random_opencode_id("msg", descending=False)
+    return session
+
+
 UPSTREAM_API_KEY_OVERRIDE = os.environ.get("UPSTREAM_API_KEY", "").strip()
 
 
@@ -2788,6 +2804,7 @@ async def get_metrics():
             snapshot["active_flows"] = active_flows_count
             snapshot["metrics"] = metrics
             snapshot["model_usage"] = model_usage_stats
+            snapshot["model_pricing"] = MODEL_PRICING
             snapshot["rotation_in_progress"] = _rotation_in_progress.is_set()
             return snapshot
     fresh = await _build_metrics_snapshot()
@@ -3044,6 +3061,10 @@ async def chat_completions(raw_request: Request):
                         stream_borrowed = False
                     else:
                         _reset_request_session("chat", session, pooled=not is_stream)
+                    if UPSTREAM_API_KEY_OVERRIDE.lower() == "public":
+                        # 匿名模式：403 疑似粘在 (session→后端) 亲和上，每次重试
+                        # 都换新 session/request ID，打散粘性（只改本请求的 headers）。
+                        _freshen_upstream_session(headers)
                     if (UPSTREAM_API_KEY_OVERRIDE.lower() == "public"
                             and ROTATE_ON_429
                             and attempt >= RATE_LIMIT_ROTATION_THRESHOLD):
