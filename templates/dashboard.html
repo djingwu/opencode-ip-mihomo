@@ -92,19 +92,15 @@
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
                     <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
-                        <tr><th class="px-5 py-2.5">模型</th><th class="px-5 py-2.5">请求数</th><th class="px-5 py-2.5">输入 Token</th><th class="px-5 py-2.5">输出 Token</th><th class="px-5 py-2.5">总 Token</th><th class="px-5 py-2.5 text-right">节省 USD</th></tr>
+                        <tr><th class="px-5 py-2.5">模型</th><th class="px-5 py-2.5">请求数</th><th class="px-5 py-2.5">输入 Token</th><th class="px-5 py-2.5">输出 Token</th><th class="px-5 py-2.5">总 Token</th><th class="px-5 py-2.5">输入报价/1M</th><th class="px-5 py-2.5">输出报价/1M</th><th class="px-5 py-2.5 text-right">节省 USD</th></tr>
                     </thead>
                     <tbody id="usage-table-body" class="divide-y divide-slate-100 font-mono text-slate-700">
-                        <tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录，发送提示词后即可实时统计。</td></tr>
+                        <tr><td colspan="8" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录，发送提示词后即可实时统计。</td></tr>
                     </tbody>
                 </table>
             </div>
             <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
-                <span id="model-page-info">第 1 / 1 页</span>
-                <div class="flex items-center space-x-1">
-                    <button id="model-prev-btn" onclick="changeModelPage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">上一页</button>
-                    <button id="model-next-btn" onclick="changeModelPage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">下一页</button>
-                </div>
+                <span id="model-page-info">共 0 个模型 · 全部展示</span>
             </div>
         </div>
 
@@ -442,11 +438,11 @@
 
     <script>
         const PAGE_SIZE = 10;
-        let currentModelPage = 1;
         let currentIpPage = 1;
         let currentNodePage = 1;
         let cachedModelKeys = [];
         let cachedUsageData = {};
+        let cachedPricingData = {};
         let cachedIpHistory = [];
         let cachedNodes = [];
         let nodeEnabledSet = new Set();
@@ -474,25 +470,23 @@
             if (tab === 'proxy') loadProxies();
         }
 
-        // ---------- 概览 ----------
+        // ---------- 概览：模型用量明细（全部展示 + Token报价） ----------
         function renderModelTable() {
             const tableBody = document.getElementById('usage-table-body');
-            const totalPages = Math.max(1, Math.ceil(cachedModelKeys.length / PAGE_SIZE));
-            if (currentModelPage > totalPages) currentModelPage = totalPages;
-            const start = (currentModelPage - 1) * PAGE_SIZE;
-            const pageKeys = cachedModelKeys.slice(start, start + PAGE_SIZE);
-            if (pageKeys.length > 0) {
-                tableBody.innerHTML = pageKeys.map(model => {
-                    const item = cachedUsageData[model];
+            if (cachedModelKeys.length > 0) {
+                tableBody.innerHTML = cachedModelKeys.map(model => {
+                    const item = cachedUsageData[model] || {};
                     const cost = item.estimated_cost_usd || 0;
-                    return `<tr class="hover:bg-slate-50/60 transition-colors"><td class="px-5 py-2.5 font-sans font-medium text-slate-900">${model}</td><td class="px-5 py-2.5">${item.requests}</td><td class="px-5 py-2.5 text-slate-400">${item.prompt_tokens.toLocaleString()}</td><td class="px-5 py-2.5 text-slate-400">${item.completion_tokens.toLocaleString()}</td><td class="px-5 py-2.5 font-bold text-slate-900">${item.total_tokens.toLocaleString()}</td><td class="px-5 py-2.5 text-right font-bold text-emerald-600">$${cost.toFixed(4)}</td></tr>`;
+                    const pricing = cachedPricingData[model] || {input_per_1m: 0.20, output_per_1m: 0.80};
+                    const inPrice = Number(pricing.input_per_1m || 0);
+                    const outPrice = Number(pricing.output_per_1m || 0);
+                    return `<tr class="hover:bg-slate-50/60 transition-colors"><td class="px-5 py-2.5 font-sans font-medium text-slate-900">${model}</td><td class="px-5 py-2.5">${item.requests || 0}</td><td class="px-5 py-2.5 text-slate-400">${(item.prompt_tokens || 0).toLocaleString()}</td><td class="px-5 py-2.5 text-slate-400">${(item.completion_tokens || 0).toLocaleString()}</td><td class="px-5 py-2.5 font-bold text-slate-900">${(item.total_tokens || 0).toLocaleString()}</td><td class="px-5 py-2.5 text-slate-500">$${inPrice.toFixed(2)}</td><td class="px-5 py-2.5 text-slate-500">$${outPrice.toFixed(2)}</td><td class="px-5 py-2.5 text-right font-bold text-emerald-600">$${cost.toFixed(4)}</td></tr>`;
                 }).join('');
             } else {
-                tableBody.innerHTML = '<tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录，发送提示词后即可实时统计。</td></tr>';
+                tableBody.innerHTML = '<tr><td colspan="8" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无请求记录，发送提示词后即可实时统计。</td></tr>';
             }
-            document.getElementById('model-page-info').innerText = `第 ${currentModelPage} / ${totalPages} 页`;
-            document.getElementById('model-prev-btn').disabled = (currentModelPage <= 1);
-            document.getElementById('model-next-btn').disabled = (currentModelPage >= totalPages);
+            const infoEl = document.getElementById('model-page-info');
+            if (infoEl) infoEl.innerText = `共 ${cachedModelKeys.length} 个模型 · 全部展示`;
         }
 
         function renderIpTable() {
@@ -512,7 +506,6 @@
             document.getElementById('ip-next-btn').disabled = (currentIpPage >= totalPages);
         }
 
-        function changeModelPage(delta) { currentModelPage += delta; renderModelTable(); }
         function changeIpPage(delta) { currentIpPage += delta; renderIpTable(); }
 
         function renderWarpQuality(data) {
@@ -552,9 +545,14 @@
                     quotaBanner.classList.add('hidden');
                 }
                 const models = data.discovered_models || [];
-                document.getElementById('model-count-badge').innerText = models.length + ' 个模型';
                 cachedUsageData = data.model_usage || {};
-                cachedModelKeys = Object.keys(cachedUsageData);
+                cachedPricingData = data.model_pricing || {};
+                cachedModelKeys = Object.keys(cachedUsageData).sort((a, b) => {
+                    const ta = (cachedUsageData[b] && cachedUsageData[b].total_tokens) || 0;
+                    const tb = (cachedUsageData[a] && cachedUsageData[a].total_tokens) || 0;
+                    return ta - tb;
+                });
+                document.getElementById('model-count-badge').innerText = cachedModelKeys.length + ' 个活跃 · 全部展示';
                 let grandTotalUsd = 0;
                 cachedModelKeys.forEach(m => { grandTotalUsd += (cachedUsageData[m].estimated_cost_usd || 0); });
                 document.getElementById('total-saved').innerText = '$' + grandTotalUsd.toFixed(4);

@@ -2882,6 +2882,7 @@ async def _build_metrics_snapshot():
         "active_flows": active_flows_count,
         "discovered_models": discovered_models,
         "model_usage": model_usage_stats,
+        "model_pricing": MODEL_PRICING,
         "ip_history": rotator_history,
         "warp_quality": dict(warp_quality_stats),
         "dual_warp": dict(_dual_warp),
