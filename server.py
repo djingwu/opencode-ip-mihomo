@@ -506,6 +506,42 @@ def record_request_history(
         pass
 
 
+async def _stream_with_history(inner_gen, *, model: str, proxies, egress_key: str, start_time: float, attempt: int):
+    """Wrap SSE generator so streaming requests also leave a request_history row.
+
+    StreamingResponse consumes the generator after the endpoint returns, so the
+    history row must be written inside the generator's finally block, otherwise
+    /api/panel/history never sees stream=true requests.
+    """
+    status = "ok"
+    error_msg = ""
+    try:
+        async for chunk in inner_gen:
+            yield chunk
+    except GeneratorExit:
+        status = "failed"
+        error_msg = "client_closed"
+        raise
+    except Exception as exc:
+        status = "failed"
+        error_msg = f"{type(exc).__name__}: {exc}"[:200]
+        raise
+    finally:
+        try:
+            record_request_history(
+                model=model,
+                proxy_ip=_request_proxy_url(proxies) or "",
+                egress_ip=egress_key or "",
+                latency_ms=round((time.time() - start_time) * 1000, 1),
+                status=status,
+                is_stream=True,
+                attempt=attempt,
+                error_msg=error_msg,
+            )
+        except Exception:
+            pass
+
+
 def log_ip_rotation_to_db(ip: str, country: str, flag: str, timestamp: str, reason: str):
     try:
         _db_execute(
@@ -3000,13 +3036,30 @@ async def chat_completions(raw_request: Request):
                 if (response.status_code == 403 and FREE_TIER_SHIM_ENABLED
                         and is_free_tier_model(current_model)
                         and attempt < MAX_RETRIES_ON_429):
-                    # 免费层偶发 403（边缘执行差异，约 10%）：同出口重试一次，
-                    # 不轮换（换 IP 对 key 级校验无用）。仍失败则按原逻辑返回。
+                    # 免费层偶发 403（边缘执行差异）：第一次同出口重试；
+                    # 匿名 public 模式下配额绑定出口 IP，连续 403 说明该出口被
+                    # 上游标记，轮换出口再试（key 模式仍保持原逻辑，换 IP 无用）。
                     if stream_borrowed:
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
                     else:
                         _reset_request_session("chat", session, pooled=not is_stream)
+                    if (UPSTREAM_API_KEY_OVERRIDE.lower() == "public"
+                            and ROTATE_ON_429
+                            and attempt >= RATE_LIMIT_ROTATION_THRESHOLD):
+                        if session_key:
+                            _session_proxy_pop(session_key)
+                        rotated, new_ip = await rotate_egress_safely(
+                            f"anonymous 403 x{attempt} for '{current_model}'"
+                        )
+                        if rotated:
+                            log.warning(
+                                "Anonymous 403 for '%s' on flagged egress; "
+                                "rotated -> %s. Retrying (%s/%s).",
+                                current_model, new_ip, attempt, MAX_RETRIES_ON_429,
+                            )
+                            await asyncio.sleep(random.uniform(0.3, 0.8))
+                            continue
                     log.warning(
                         "Transient upstream 403 for '%s'; retrying same egress (%s/%s).",
                         current_model, attempt, MAX_RETRIES_ON_429,
@@ -3034,6 +3087,16 @@ async def chat_completions(raw_request: Request):
                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"[Upstream {response.status_code}] {error_body}"}, "finish_reason": "stop"}]
                     }
                     error_sse = f"data: {json.dumps(error_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    record_request_history(
+                        model=current_model,
+                        proxy_ip=_request_proxy_url(proxies) or "",
+                        egress_ip=egress_key,
+                        latency_ms=round((time.time() - start_time) * 1000, 1),
+                        status="failed",
+                        is_stream=True,
+                        attempt=attempt,
+                        error_msg=f"upstream_{response.status_code}",
+                    )
                     return StreamingResponse(
                         [error_sse, "data: [DONE]\n\n"],
                         media_type="text/event-stream",
@@ -3069,10 +3132,14 @@ async def chat_completions(raw_request: Request):
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
                     if current_model in RESPONSES_ONLY_MODELS:
-                        stream_gen = responses_stream_as_chat(response, current_model, session=session if stream_borrowed else None, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                        inner_gen = responses_stream_as_chat(response, current_model, session=session if stream_borrowed else None, stream_pool_key=stream_pool_key if stream_borrowed else None)
                     else:
-                        stream_gen = stream_response(response, current_model, session=session, stream_pool_key=stream_pool_key if stream_borrowed else None)
-                    # 流式只记一条 history（播完才算成功）；token 先按估算记一次，
+                        inner_gen = stream_response(response, current_model, session=session, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                    stream_gen = _stream_with_history(
+                        inner_gen, model=current_model, proxies=proxies,
+                        egress_key=egress_key, start_time=start_time, attempt=attempt,
+                    )
+                    # 流式只记一条 history（包装器播完才写）；token 先按估算记一次，
                     # 真实 usage 由 responses 转换函数在 completion 事件里再记（幂等聚合）
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
                     return StreamingResponse(
@@ -3278,8 +3345,14 @@ async def anthropic_messages(raw_request: Request):
             prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
 
             if is_stream:
-                return StreamingResponse(
+                stream_gen = _stream_with_history(
                     stream_response(response, model_name, session=session, protocol="anthropic", stream_pool_key=stream_pool_key if stream_borrowed else None),
+                    model=model_name, proxies=proxies,
+                    egress_key=egress_key, start_time=start_time, attempt=attempt,
+                )
+                track_token_usage(model_name, prompt_tokens=100, completion_tokens=150)
+                return StreamingResponse(
+                    stream_gen,
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -3297,6 +3370,15 @@ async def anthropic_messages(raw_request: Request):
                             model_name,
                             prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
                             completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+                        )
+                        record_request_history(
+                            model=model_name,
+                            proxy_ip=_request_proxy_url(proxies) or "",
+                            egress_ip=egress_key,
+                            latency_ms=round((time.time() - start_time) * 1000, 1),
+                            status="ok",
+                            is_stream=False,
+                            attempt=attempt,
                         )
                         return JSONResponse(content=res_json)
                     except EmptyStreamError:
@@ -3430,8 +3512,14 @@ async def responses_endpoint(raw_request: Request):
             prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)
 
             if is_stream:
-                return StreamingResponse(
+                stream_gen = _stream_with_history(
                     stream_response(response, model_name, session=session, protocol="responses", stream_pool_key=stream_pool_key if stream_borrowed else None),
+                    model=model_name, proxies=proxies,
+                    egress_key=egress_key, start_time=start_time, attempt=attempt,
+                )
+                track_token_usage(model_name, prompt_tokens=100, completion_tokens=150)
+                return StreamingResponse(
+                    stream_gen,
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -3444,6 +3532,16 @@ async def responses_endpoint(raw_request: Request):
                             stream_borrowed = False
                         else:
                             res_json = await asyncio.to_thread(response.json)
+                        track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
+                        record_request_history(
+                            model=model_name,
+                            proxy_ip=_request_proxy_url(proxies) or "",
+                            egress_ip=egress_key,
+                            latency_ms=round((time.time() - start_time) * 1000, 1),
+                            status="ok",
+                            is_stream=False,
+                            attempt=attempt,
+                        )
                         return JSONResponse(content=res_json)
                     except EmptyStreamError:
                         if stream_borrowed:
