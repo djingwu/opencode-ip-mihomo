@@ -382,6 +382,11 @@ def _flush_metrics_buffers() -> None:
         except Exception:
             pass
         _prune_request_history()
+    # 全局计数器随批量刷盘一起落盘（约每 10s），重建容器后可恢复，总请求数不再归零
+    try:
+        save_global_counters()
+    except Exception:
+        pass
 
 
 def _metrics_flush_loop() -> None:
@@ -459,6 +464,45 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_request_history_created "
         "ON request_history(created_at)"
     )
+    _db_execute("""
+        CREATE TABLE IF NOT EXISTS global_counters (
+            key TEXT PRIMARY KEY,
+            value INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
+PERSISTED_COUNTER_KEYS = (
+    "total_requests",
+    "successful_requests",
+    "rate_limited_requests",
+    "quota_exhausted_requests",
+    "fallback_triggered",
+)
+
+
+def load_global_counters() -> Dict[str, int]:
+    if not DB_FILE.exists():
+        return {}
+    try:
+        rows = _db_fetchall("SELECT key, value FROM global_counters")
+        return {r[0]: int(r[1] or 0) for r in rows}
+    except Exception as e:
+        log.error(f"Error loading global counters: {e}")
+        return {}
+
+
+def save_global_counters() -> None:
+    try:
+        rows = [(k, int(metrics.get(k, 0) or 0)) for k in PERSISTED_COUNTER_KEYS]
+        _db_executemany("""
+            INSERT INTO global_counters (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+        """, rows)
+    except Exception as e:
+        log.error(f"Failed to save global counters: {e}")
 
 
 def acquire_flow_lease() -> str:
@@ -1122,6 +1166,92 @@ def is_free_tier_model(name) -> bool:
 
 CORE_AGENT_TOOLS = ["bash", "edit", "glob", "grep", "read"]
 
+TITLE_PROMPT_PREFIX = "Generate a title for this conversation:"
+# 新版标题提示词（system 角色）：固定指令头，可做特征识别
+TITLE_GEN_MARKERS = ("title generator", "thread title")
+
+
+def _part_text(p) -> str:
+    """抽取内容段文本，兼容 OpenAI / Anthropic / Responses 多种段形状。"""
+    if isinstance(p, str):
+        return p
+    if not isinstance(p, dict):
+        return ""
+    for key in ("text", "content", "input", "output"):
+        v = p.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def _msg_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(t for t in (_part_text(p) for p in content) if t)
+    if isinstance(content, dict):
+        return _msg_text(content.get("content", ""))
+    return ""
+
+
+def _pick_title_line(candidates: list[str]) -> Optional[str]:
+    """从候选文本取标题首行；跳过提示词样板本身，避免把指令当标题返回。"""
+    for cand in candidates:
+        for ln in cand.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if s.startswith(TITLE_PROMPT_PREFIX):
+                continue
+            if "title generator" in low and "thread title" in low:
+                continue
+            if low.startswith("generate a brief title"):
+                continue
+            return s[:60] if len(s) <= 60 else s[:57] + "..."
+    return None
+
+
+def _extract_local_title(messages) -> Optional[str]:
+    """Detect OpenCode title-generation requests; synthesize title locally.
+
+    两种已知格式（均为无工具后台调用，易触发上游免费层 FreeTierError 403，
+    而正常聊天带 tools 能过；标题只是装饰文本，本地合成直接返回）：
+    1. 老格式：messages[0] 为 user 且以 "Generate a title for this conversation:" 开头；
+    2. 新格式：首条 system 含 "title generator"+"thread title" 指令（Only thread title /
+       Generate a brief title…），标题源取其后的首条 user 消息。
+    Returns the title string, or None if this is not a title request.
+    """
+    try:
+        if not isinstance(messages, list) or not messages:
+            return None
+        texts = [(_m.get("role", ""), _msg_text(_m.get("content", ""))) if isinstance(_m, dict) else ("", "") for _m in messages]
+        first_role, first_text = texts[0]
+        candidates: list[str] = []
+        if first_role == "user" and first_text.startswith(TITLE_PROMPT_PREFIX):
+            rest = first_text[len(TITLE_PROMPT_PREFIX):].strip()
+            if rest:
+                candidates.append(rest)
+            candidates.extend(t for r, t in texts[1:] if t.strip())
+        elif first_role in ("system", "user") and all(mk in first_text.lower() for mk in TITLE_GEN_MARKERS):
+            # 新格式：首条即标题指令，其后所有 user 消息都作为标题源候选
+            #（指令与正文之间可能隔着空壳 user 段，不能取一段就 break），
+            # 样板行由 _pick_title_line 统一过滤。
+            for r, t in texts[1:]:
+                if r == "user" and t.strip():
+                    candidates.append(t.strip())
+            if not candidates:
+                for r, t in texts:
+                    if r == "user" and t.strip() and "title generator" not in t.lower():
+                        candidates.append(t.strip())
+                        break
+        else:
+            return None
+        title = _pick_title_line(candidates)
+        return title if title is not None else "New session"
+    except Exception:
+        return None
+
 
 def _shim_tool_responses(name: str) -> dict:
     return {
@@ -1740,6 +1870,24 @@ async def lifespan(application: FastAPI):
         log.warning("mihomo config migration failed: %s", exc)
     init_db()
     model_usage_stats = load_metrics_from_db()
+    # 恢复持久化计数器；老版本从未落盘，用 model_usage 求和兜底，避免重建后归零
+    try:
+        saved_counters = load_global_counters()
+        for _k in PERSISTED_COUNTER_KEYS:
+            if _k in saved_counters:
+                metrics[_k] = max(int(metrics.get(_k, 0) or 0), int(saved_counters[_k] or 0))
+        _usage_sum = sum(int((v or {}).get("requests", 0) or 0) for v in model_usage_stats.values())
+        if _usage_sum > 0:
+            if int(metrics.get("total_requests", 0) or 0) < _usage_sum:
+                metrics["total_requests"] = _usage_sum
+            if int(metrics.get("successful_requests", 0) or 0) < _usage_sum:
+                # 成功数与用量统计口径接近，至少不小于用量和，避免同样归零
+                metrics["successful_requests"] = max(
+                    int(metrics.get("successful_requests", 0) or 0),
+                    min(_usage_sum, int(metrics.get("total_requests", 0) or 0)),
+                )
+    except Exception as exc:
+        log.warning("restore global counters failed: %s", exc)
     # 出口状态由后台 watcher 异步首刷；启动路径不同步打外部站，避免拖慢 boot
     start_egress_watcher()
     start_metrics_flusher()
@@ -1936,22 +2084,6 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
         "x-session-affinity": session,
         "X-Session-Id": session,
     }
-
-
-def _freshen_upstream_session(headers: Dict[str, str]) -> str:
-    """Generate a fresh upstream session/request ID pair.
-
-    Used for anonymous 403 recovery: upstream appears to pin (session → backend)
-    affinity, so retrying with the same ses_ ID can hit the same strict backend.
-    Only the in-flight request's headers are mutated; the per-client cached
-    session is untouched.
-    """
-    session = _random_opencode_id("ses", descending=True)
-    headers["x-opencode-session"] = session
-    headers["x-session-affinity"] = session
-    headers["X-Session-Id"] = session
-    headers["x-opencode-request"] = _random_opencode_id("msg", descending=False)
-    return session
 
 
 UPSTREAM_API_KEY_OVERRIDE = os.environ.get("UPSTREAM_API_KEY", "").strip()
@@ -2951,6 +3083,18 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
+    # 标题兜底预判（只记录、不拦截）：OpenCode 标题生成是无工具后台请求，
+    # 偶发上游免费层 403。平时放行走上游以保证标题质量，仅在最终 403 时才
+    # 本地合成返回，避免把 "[Upstream 403]..." 当标题显示。
+    _tools_val = payload.get("tools")
+    _has_real_tools = isinstance(_tools_val, list) and len(_tools_val) > 0
+    _title_fallback: Optional[str] = None
+    if not _has_real_tools and isinstance(payload.get("messages"), list):
+        _title_fallback = _extract_local_title(payload.get("messages"))
+        if _title_fallback is not None:
+            log.info("title-request detected model=%s fallback=%r (passthrough upstream first)",
+                     current_model, _title_fallback[:60])
+
     # Responses-only 模型：转换 body 格式并切换目标 URL
     _target_url = TARGET_ZEN_URL
     if current_model in RESPONSES_ONLY_MODELS:
@@ -3054,42 +3198,78 @@ async def chat_completions(raw_request: Request):
                 if (response.status_code == 403 and FREE_TIER_SHIM_ENABLED
                         and is_free_tier_model(current_model)
                         and attempt < MAX_RETRIES_ON_429):
-                    # 免费层偶发 403（边缘执行差异）：第一次同出口重试；
-                    # 匿名 public 模式下配额绑定出口 IP，连续 403 说明该出口被
-                    # 上游标记，轮换出口再试（key 模式仍保持原逻辑，换 IP 无用）。
+                    # B方案（public匿名模式）：403 不轮换、不换 session、不解绑，
+                    # 只做同出口指数退避。原因：同一 public key 短时间内从多
+                    # 个机房 IP 跳变/并发，会被上游识别为代理共享并持续 403
+                    #（FreeTierError），轮换反而坐实特征。保持会话粘性更像
+                    # 真实单客户端重试。
                     if stream_borrowed:
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
                     else:
                         _reset_request_session("chat", session, pooled=not is_stream)
-                    if UPSTREAM_API_KEY_OVERRIDE.lower() == "public":
-                        # 匿名模式：403 疑似粘在 (session→后端) 亲和上，每次重试
-                        # 都换新 session/request ID，打散粘性（只改本请求的 headers）。
-                        _freshen_upstream_session(headers)
-                    if (UPSTREAM_API_KEY_OVERRIDE.lower() == "public"
-                            and ROTATE_ON_429
-                            and attempt >= RATE_LIMIT_ROTATION_THRESHOLD):
-                        if session_key:
-                            _session_proxy_pop(session_key)
-                        rotated, new_ip = await rotate_egress_safely(
-                            f"anonymous 403 x{attempt} for '{current_model}'"
-                        )
-                        if rotated:
-                            log.warning(
-                                "Anonymous 403 for '%s' on flagged egress; "
-                                "rotated -> %s. Retrying (%s/%s).",
-                                current_model, new_ip, attempt, MAX_RETRIES_ON_429,
-                            )
-                            await asyncio.sleep(random.uniform(0.3, 0.8))
-                            continue
                     log.warning(
-                        "Transient upstream 403 for '%s'; retrying same egress (%s/%s).",
-                        current_model, attempt, MAX_RETRIES_ON_429,
+                        "Transient upstream 403 for '%s'; retrying same egress (%s/%s) egress=%s proxy=%s.",
+                        current_model, attempt, MAX_RETRIES_ON_429, egress_key, _request_proxy_url(proxies),
                     )
                     delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     await asyncio.sleep(delay)
                     continue
                 log.warning("Upstream HTTP %s for '%s'; returning error to client.", response.status_code, current_model)
+                if response.status_code == 403 and current_model in RESPONSES_ONLY_MODELS:
+                    try:
+                        _dump = json.dumps(
+                            {"tools": upstream_payload.get("tools"),
+                             "tool_choice": upstream_payload.get("tool_choice"),
+                             "input": upstream_payload.get("input"),
+                             "stream": upstream_payload.get("stream"),
+                             "model": upstream_payload.get("model")},
+                            ensure_ascii=False, default=str,
+                        )
+                        log.warning("403-payload model=%s egress=%s len=%s body=%s", current_model, egress_key, len(_dump), _dump[:3000])
+                    except Exception as _e:
+                        log.warning("403-payload dump failed: %s", _e)
+                if response.status_code == 403 and _title_fallback is not None:
+                    # 标题兜底：仅当上游拒掉标题生成时，用本地合成代替
+                    # “[Upstream 403]…” 错误文本，标题栏不再挂 403。平时放行，
+                    # 99% 的标题仍由上游生成以保证质量；正常聊天不受影响。
+                    log.warning("title-403-fallback model=%s title=%r", current_model, _title_fallback[:60])
+                    if stream_borrowed:
+                        _release_stream_session(stream_pool_key, session, discard=True)
+                        stream_borrowed = False
+                    try:
+                        record_request_history(
+                            model=current_model,
+                            proxy_ip=_request_proxy_url(proxies) or "",
+                            egress_ip=egress_key,
+                            latency_ms=round((time.time() - start_time) * 1000, 1),
+                            status="ok",
+                            is_stream=bool(is_stream),
+                            attempt=attempt,
+                            error_msg="title_fallback",
+                        )
+                    except Exception:
+                        pass
+                    track_token_usage(current_model, prompt_tokens=20, completion_tokens=5)
+                    if is_stream:
+                        _ftid = f"chatcmpl-{int(time.time())}"
+                        _fnow = int(time.time())
+                        _ftext = _title_fallback
+
+                        async def _fallback_stream():
+                            head = {"id": _ftid, "object": "chat.completion.chunk", "created": _fnow, "model": current_model,
+                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": _ftext}, "finish_reason": None}]}
+                            yield f"data: {json.dumps(head, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                            yield "data: [DONE]\n\n"
+
+                        return StreamingResponse(_fallback_stream(), media_type="text/event-stream",
+                                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
+                    return JSONResponse(content={
+                        "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion", "created": int(time.time()),
+                        "model": current_model,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": _title_fallback}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+                    })
                 if is_stream:
                     # 流式请求：读取错误响应体，返回 SSE 格式的错误
                     try:
