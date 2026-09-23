@@ -74,10 +74,12 @@ services:
       - MIHOMO_CONFIG_DIR=/data/mihomo
       - MIHOMO_CONTROLLER_CONFIG_PATH=/root/.config/mihomo/config.yaml
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://127.0.0.1:24513,http://localhost:24513}
-      # OpenCode Zen 免费层：单并发、匿名 IP 约 10 RPM；429 先在原出口等待，连续两次才换出口
+      # OpenCode Zen 免费层：单并发、匿名 IP 约 10 RPM；匿名按会话绑定出口，
+      # 429/新会话/长间隔换池内下一个出口，配额按 IP 分摊
       - MAX_RETRIES_ON_429=${MAX_RETRIES_ON_429:-4}
       - UPSTREAM_RPM=${UPSTREAM_RPM:-10}
       - MAX_UPSTREAM_CONCURRENCY=${MAX_UPSTREAM_CONCURRENCY:-1}
+      - ANON_SESSION_GAP_SECONDS=${ANON_SESSION_GAP_SECONDS:-600}
       # 服务端强制替换下游凭证的上游有效 key（.env 里配，从不进仓库）
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
       - RATE_LIMIT_ROTATION_THRESHOLD=${RATE_LIMIT_ROTATION_THRESHOLD:-2}

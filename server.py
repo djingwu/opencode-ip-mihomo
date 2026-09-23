@@ -167,6 +167,26 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
         if bound_proxy:
             # 检查绑定的代理是否仍可用
             if proxy_pool.is_proxy_eligible(bound_proxy):
+                if UPSTREAM_API_KEY_OVERRIDE.lower() == "public":
+                    # 匿名按会话绑定：活跃会话稳定复用；长间隔后视为新会话，
+                    # 换池内下一个出口（分摊各 IP 日配额）
+                    now = time.monotonic()
+                    with _anon_egress_lock:
+                        if len(_anon_last_seen) >= SESSION_CACHE_MAX_KEYS and session_key not in _anon_last_seen:
+                            _anon_last_seen.clear()
+                        last = _anon_last_seen.get(session_key, 0.0)
+                        _anon_last_seen[session_key] = now
+                    if last and now - last > ANON_SESSION_GAP_SECONDS:
+                        nxt = None
+                        try:
+                            nxt = proxy_pool.next_proxy_after(bound_proxy)
+                        except Exception as exc:
+                            log.warning("Anonymous new-session egress advance failed: %s", exc)
+                        if nxt and nxt != bound_proxy:
+                            _session_proxy_set(session_key, nxt)
+                            log.info("New anonymous session after %.0fs gap; egress %s -> %s.",
+                                     now - last, bound_proxy, nxt)
+                            return {"http": nxt, "https": nxt}
                 return {"http": bound_proxy, "https": bound_proxy}
             else:
                 # 代理不可用，清除绑定
@@ -1810,6 +1830,14 @@ _discovery_lock = threading.Lock()
 _session_proxy_map: Dict[str, tuple] = {}
 _session_proxy_map_lock = threading.Lock()
 SESSION_PROXY_TTL_SECONDS = max(60, int(os.environ.get("SESSION_PROXY_TTL_SECONDS", "3600")))
+# public 匿名按会话绑定出口：OpenAI 兼容协议不带会话 ID，单一下游凭证只能看到
+# 一个 session_key，因此用“新会话信号 + 长间隔”近似区分会话：
+#  - 标题请求只在 OpenCode 新会话首条消息时发一次，是最准的新会话信号；
+#  - 超过间隔无请求则视为新会话，换下一个出口（分摊各 IP 日配额）；
+# 会话活跃期间稳定复用同一出口（亲和不断），429 另行即时换出口。
+_anon_egress_lock = threading.Lock()
+_anon_last_seen: Dict[str, float] = {}
+ANON_SESSION_GAP_SECONDS = max(60, int(os.environ.get("ANON_SESSION_GAP_SECONDS", "600")))
 # 按客户端标识缓存 x-opencode-session，同样加软上限防刷 key
 _session_cache: Dict[str, str] = {}
 _session_cache_lock = threading.Lock()
@@ -2257,6 +2285,8 @@ async def recover_from_rate_limit(
                 nxt = None
             if nxt and nxt != (current_proxy or None):
                 _session_proxy_set(session_key, nxt)
+                with _anon_egress_lock:
+                    _anon_last_seen[session_key] = time.monotonic()
                 if stream_pool_key is not None:
                     _release_stream_session(stream_pool_key, session, discard=True)
                 else:
@@ -3169,6 +3199,21 @@ async def chat_completions(raw_request: Request):
 
     # 会话标识：优先用客户端传入的 x-opencode-session，否则用 client_key
     session_key = headers.get("x-opencode-session", "") or client_key
+
+    if _title_fallback is not None and session_key and UPSTREAM_API_KEY_OVERRIDE.lower() == "public":
+        # 新会话信号：标题请求只在 OpenCode 新会话首条消息时发一次，
+        # 新会话换下一个出口（分摊日配额；small_model 直连时标题不经过
+        # 代理，由下面的长间隔逻辑兜底）
+        try:
+            _cur = _session_proxy_get(session_key)
+            _nxt = proxy_pool.next_proxy_after(_cur or proxy_pool.active_proxy())
+            if _nxt and _nxt != _cur:
+                _session_proxy_set(session_key, _nxt)
+                with _anon_egress_lock:
+                    _anon_last_seen[session_key] = time.monotonic()
+                log.info("New anonymous session (title request); egress %s -> %s.", _cur, _nxt)
+        except Exception as exc:
+            log.warning("Title-triggered egress advance failed: %s", exc)
 
     consecutive_timeouts = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
