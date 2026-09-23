@@ -2236,12 +2236,43 @@ async def recover_from_rate_limit(
     egress_key: str,
     attempt: int,
     stream_pool_key=None,
+    session_key: str = "",
+    current_proxy: str = "",
 ) -> bool:
     """Retry a transient 429 once on the same IP before considering rotation."""
     category, retry_after, _ = classify_upstream_429(response)
     if category == "quota":
         return False
     if retry_after is not None and retry_after > LONG_BAN_THRESHOLD_SECONDS:
+        if (UPSTREAM_API_KEY_OVERRIDE.lower() == "public" and session_key
+                and attempt < MAX_RETRIES_ON_429):
+            # public 匿名模式配额按出口 IP 算（日配额、retry-after 到午夜清零），
+            # 长封禁只代表当前出口没额度，换池内下一个可用出口再试。key 模式
+            # 仍走下面的原逻辑（换 IP 无用，直接透传）。
+            nxt = None
+            try:
+                nxt = proxy_pool.next_proxy_after(current_proxy or None)
+            except Exception as exc:
+                log.warning("Public-mode egress reselect failed: %s", exc)
+                nxt = None
+            if nxt and nxt != (current_proxy or None):
+                _session_proxy_set(session_key, nxt)
+                if stream_pool_key is not None:
+                    _release_stream_session(stream_pool_key, session, discard=True)
+                else:
+                    _reset_request_session(endpoint, session, pooled=pooled)
+                log.warning(
+                    "Long upstream ban (retry_after=%ss) on %s is per-egress quota in public mode; "
+                    "session re-bound %s -> %s. Retrying (%s/%s).",
+                    retry_after, egress_key, current_proxy, nxt, attempt, MAX_RETRIES_ON_429,
+                )
+                await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
+                return True
+            log.warning(
+                "Long upstream ban for '%s' (retry_after=%ss > %ss); no other egress available, passing through.",
+                model_name, retry_after, LONG_BAN_THRESHOLD_SECONDS,
+            )
+            return False
         # key/账号级长封禁（如 retry-after 数小时）：换出口无用，不重试不轮换，
         # 直接返回 False 让调用方把 429 + Retry-After 透给下游退避。
         log.warning(
@@ -3177,7 +3208,7 @@ async def chat_completions(raw_request: Request):
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
                     return upstream_rate_limit_response(response, current_model)
-                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None):
+                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -3524,7 +3555,7 @@ async def anthropic_messages(raw_request: Request):
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None):
+                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -3691,7 +3722,7 @@ async def responses_endpoint(raw_request: Request):
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None):
+                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
