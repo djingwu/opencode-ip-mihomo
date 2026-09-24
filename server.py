@@ -1792,7 +1792,9 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                 _discard_stream_session = True
                 break
 
-        # 发 finish chunk
+        # 发 finish chunk（带过工具调用时 finish 必须为 tool_calls，否则下游忽略调用直接停住）
+        if tool_call_state and finish_reason == "stop":
+            finish_reason = "tool_calls"
         yield make_chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
 
@@ -3234,6 +3236,17 @@ async def chat_completions(raw_request: Request):
 
     # 免费层伪装：responses 形态补 responses-tools，否则补 chat-tools；
     # responses-only 免费模型的非流请求强制走上游流式再拼回 JSON。
+    # _fake_tools_only：下游没带真工具时，上游看到的全是 shim 假 tools，
+    # 模型若被诱发调用，下游执行不了，需由代理侧续一轮（见非流 collapse 处）。
+    _fake_tools_only = (current_model in RESPONSES_ONLY_MODELS) and not _has_real_tools
+    _downstream_tool_names = set()
+    if isinstance(_tools_val, list):
+        for _t in _tools_val:
+            if isinstance(_t, dict):
+                _fn = _t.get("function")
+                _nm = (_fn.get("name") if isinstance(_fn, dict) else None) or _t.get("name")
+                if _nm:
+                    _downstream_tool_names.add(_nm)
     if current_model in RESPONSES_ONLY_MODELS:
         payload = ensure_free_tier_tools_responses(payload)
     else:
@@ -3491,6 +3504,38 @@ async def chat_completions(raw_request: Request):
                                 res_json = await _collect_responses_stream(response)
                             else:
                                 res_json = await _collect_chat_stream(response, current_model)
+                            if (current_model in RESPONSES_ONLY_MODELS and _fake_tools_only
+                                    and isinstance(res_json, dict)):
+                                # 下游无真工具时模型被 shim 假 tools 诱发的调用下游执行不了：
+                                # 代理侧合成工具结果续问一轮，否则下游只见前言文本就停住
+                                _round1_calls = [it for it in (res_json.get("output") or [])
+                                                 if isinstance(it, dict) and it.get("type") == "function_call"]
+                                _unexecutable = [c for c in _round1_calls
+                                                 if (c.get("name") or "") not in _downstream_tool_names]
+                                if _unexecutable:
+                                    log.info("Fake-tool calls %s on '%s'; continuing proxy-side (1 round).",
+                                             [c.get("name") for c in _unexecutable], current_model)
+                                    _follow_input = list((upstream_payload.get("input") if isinstance(upstream_payload, dict) else []) or [])
+                                    _follow_input = _follow_input + _round1_calls + [
+                                        {"type": "function_call_output",
+                                         "call_id": c.get("call_id") or c.get("id") or "call_unknown",
+                                         "output": "工具执行环境不可用（缺少必要参数），请直接根据已看到的图片与上下文作答，不要再调用工具。/ Tool execution unavailable (missing arguments); answer directly from visible context without further tool calls."}
+                                        for c in _round1_calls]
+                                    _payload2 = dict(upstream_payload) if isinstance(upstream_payload, dict) else {"model": current_model}
+                                    _payload2["input"] = _follow_input
+                                    try:
+                                        _resp2 = await _post_upstream_stream(
+                                            session, _target_url, json_body=_payload2, headers=headers,
+                                            proxies=proxies,
+                                            timeout=MODEL_TIMEOUT_OVERRIDES.get(current_model, STREAM_TIMEOUT),
+                                        )
+                                        res_json = await _collect_responses_stream(_resp2)
+                                        # 只续一轮：若仍调工具则剥离调用返回文本，保证终止
+                                        _out2 = res_json.get("output") if isinstance(res_json, dict) else None
+                                        if isinstance(_out2, list) and any(isinstance(it, dict) and it.get("type") == "function_call" for it in _out2):
+                                            res_json["output"] = [it for it in _out2 if not (isinstance(it, dict) and it.get("type") == "function_call")]
+                                    except EmptyStreamError:
+                                        pass
                             _release_stream_session(stream_pool_key, session, discard=False)
                             stream_borrowed = False
                         else:
