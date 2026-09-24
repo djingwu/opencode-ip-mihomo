@@ -1063,6 +1063,39 @@ RESPONSES_ONLY_MODELS = {
     "muse-spark-1.2-contributor",
 }
 
+def _convert_content_part(part: dict, text_type: str):
+    """Chat Completions 内容段 → Responses API input 内容段。
+
+    text → input_text/output_text；image_url → input_image（上游不认
+    image_url，原样透传会 400 invalid_request_error）；file → input_file。
+    已是 Responses 形态或未知类型则原样透传/丢弃空段。
+    """
+    if not isinstance(part, dict):
+        return None
+    ptype = part.get("type")
+    if ptype == "text" or (ptype in ("input_text", "output_text") and ptype != text_type):
+        return {"type": text_type, "text": part.get("text", "")}
+    if ptype in ("input_text", "output_text", "input_image", "input_file"):
+        return part
+    if ptype == "image_url":
+        iu = part.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else iu
+        if not isinstance(url, str) or not url:
+            return None
+        out = {"type": "input_image", "image_url": url}
+        if isinstance(iu, dict) and iu.get("detail"):
+            out["detail"] = iu["detail"]
+        return out
+    if ptype == "file":
+        inner = part.get("file")
+        if not isinstance(inner, dict):
+            return None
+        out = {"type": "input_file"}
+        out.update(inner)
+        return out
+    return part
+
+
 def _convert_messages_to_input(messages: list) -> list:
     """将 Chat Completions messages 格式转为 Responses API input 格式。
     Chat: [{"role":"user","content":"hi"}]
@@ -1116,16 +1149,17 @@ def _convert_messages_to_input(messages: list) -> list:
                 "content": [{"type": text_type, "text": content}]
             })
         elif isinstance(content, list):
-            if role == "assistant":
-                content = [
-                    {**item, "type": "output_text"}
-                    if isinstance(item, dict) and item.get("type") == "input_text"
-                    else item
-                    for item in content
-                ]
+            text_type = "output_text" if role == "assistant" else "input_text"
+            converted = []
+            for item in content:
+                c = _convert_content_part(item, text_type)
+                if c is not None:
+                    converted.append(c)
+            if not converted:
+                continue
             result.append({
                 "role": role,
-                "content": content
+                "content": converted
             })
         else:
             result.append(msg)
