@@ -1193,6 +1193,46 @@ def _convert_tools_to_responses_format(tools: list) -> list:
     return result
 
 
+def _strictify_json_schema(schema):
+    """Responses/Console 对 json_schema 要求每个 object 都带 additionalProperties:false。"""
+    if isinstance(schema, dict):
+        out = {k: _strictify_json_schema(v) for k, v in schema.items()}
+        if out.get("type") == "object" and "additionalProperties" not in out:
+            out["additionalProperties"] = False
+        return out
+    if isinstance(schema, list):
+        return [_strictify_json_schema(v) for v in schema]
+    return schema
+
+
+def _response_format_to_text_format(rf):
+    """Chat Completions response_format → Responses API text.format。
+
+    OpenAI 上游（Zen/Console）不认 response_format（400 unknown parameter），
+    但支持 text.format（json_object 已验证 200；json_schema 需附
+    additionalProperties:false）。无法映射时返回 None 由调用方丢弃。
+    """
+    if not isinstance(rf, dict):
+        return None
+    rtype = rf.get("type")
+    if rtype in ("json_object",):
+        return {"format": {"type": "json_object"}}
+    if rtype in ("json_schema", "json"):
+        inner = rf.get("json_schema") if rtype == "json_schema" else rf
+        if not isinstance(inner, dict):
+            return None
+        schema = inner.get("schema", rf.get("schema"))
+        if not isinstance(schema, dict):
+            return None
+        return {"format": {
+            "type": "json_schema",
+            "name": inner.get("name") or rf.get("name") or "response",
+            "schema": _strictify_json_schema(schema),
+            "strict": bool(inner.get("strict", rf.get("strict", True))),
+        }}
+    return None
+
+
 def _convert_tool_choice_to_responses_format(tool_choice):
     """将 Chat Completions tool_choice 格式转为 Responses API 格式。
     上游仅支持字符串 "auto"，所有其他值均回退为 auto 或移除。
@@ -1213,6 +1253,8 @@ def _convert_tool_choice_to_responses_format(tool_choice):
 # 代理对免费模型自动补核心 tools；下游非流请求则强制走上游流式，
 # 播完聚合拼回下游要的 JSON（stream collapse），保证下游契约不变。
 FREE_TIER_SHIM_ENABLED = os.environ.get("FREE_TIER_SHIM_ENABLED", "true").lower() in ("true", "1", "yes")
+# 临时诊断（req-diag / stream-summary 日志）：排查"发图后只回前半句"类问题用
+REQ_DIAG_ENABLED = os.environ.get("REQ_DIAG", "0").lower() in ("true", "1", "yes")
 
 def is_free_tier_model(name) -> bool:
     return bool(name) and "free" in str(name).lower()
@@ -1699,6 +1741,8 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
     saw_completed = False
     completed_ok = False
     _depth = 0
+    _text_len = 0
+    _text_head = ""
 
     def make_chunk(delta: dict, finish: str = None) -> bytes:
         chunk = {
@@ -1763,6 +1807,10 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
             event_type = data.get("type", "")
             if event_type == "response.output_text.delta":
                 delta_text = data.get("delta", "")
+                if isinstance(delta_text, str) and delta_text:
+                    _text_len += len(delta_text)
+                    if len(_text_head) < 120:
+                        _text_head = (_text_head + delta_text)[:120]
                 yield make_chunk({"content": delta_text})
             elif event_type == "response.output_text.done":
                 pass  # 内容已通过 delta 发送
@@ -1818,6 +1866,8 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                             saw_completed = False
                             completed_ok = False
                             _depth = 1
+                            _text_len = 0
+                            _text_head = ""
                             continue
                         if _r2 is not None:
                             try:
@@ -1851,7 +1901,7 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                         "name": data.get("name") or "tool",
                     }
                     tool_call_state[key] = state
-                if followup is None or _depth > 0:
+                if followup is None:
                     yield make_chunk({
                         "tool_calls": [{
                             "index": state["index"],
@@ -1863,14 +1913,21 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                             },
                         }]
                     })
-                # 假 tools 首轮调用块不播给下游（执行不了），攒着代理侧续问
+                # 假 tools 场景（followup 非空）：调用块一律不播给下游
+                #（下游没有真工具，执行不了会卡死），首轮攒着代理侧续问
             elif event_type == "error":
                 _discard_stream_session = True
                 break
 
         # 发 finish chunk（带过工具调用时 finish 必须为 tool_calls，否则下游忽略调用直接停住）
-        if tool_call_state and finish_reason == "stop":
+        if tool_call_state and finish_reason == "stop" and followup is None:
             finish_reason = "tool_calls"
+        if followup is not None and _depth > 0 and _text_len == 0:
+            # 续问的最终轮仍只调工具没文本：给一句兜底，避免下游只见首轮前言
+            yield make_chunk({"content": "（本轮未能完成分析，请重试或补充说明。）"})
+        if REQ_DIAG_ENABLED:
+            log.info("stream-summary model=%s depth=%d text_len=%d head=%r calls=%d finish=%s completed=%s",
+                     model_name, _depth, _text_len, _text_head, len(done_calls), finish_reason, saw_completed)
         yield make_chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
 
@@ -3275,6 +3332,32 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
+    if REQ_DIAG_ENABLED:
+        try:
+            _dj = json.dumps(payload, ensure_ascii=False, default=str)
+            _msg_list = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+            _last_user = ""
+            for _m in reversed(_msg_list):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _c = _m.get("content")
+                    if isinstance(_c, str):
+                        _last_user = _c
+                    elif isinstance(_c, list):
+                        _last_user = " ".join(
+                            p.get("text", "") for p in _c
+                            if isinstance(p, dict) and isinstance(p.get("text"), str))
+                    break
+            log.info(
+                "req-diag model=%s stream=%s msgs=%d imgs=%d files=%d tools=%d rf=%r last_user=%r body_len=%d",
+                current_model, is_stream, len(_msg_list),
+                _dj.count('"image_url"') + _dj.count('"input_image"'),
+                _dj.count('"input_file"'),
+                len(payload.get("tools")) if isinstance(payload.get("tools"), list) else 0,
+                payload.get("response_format"), _last_user[:80], len(_dj),
+            )
+        except Exception:
+            pass
+
     # 标题兜底预判（只记录、不拦截）：OpenCode 标题生成是无工具后台请求，
     # 偶发上游免费层 403。平时放行走上游以保证标题质量，仅在最终 403 时才
     # 本地合成返回，避免把 "[Upstream 403]..." 当标题显示。
@@ -3305,8 +3388,19 @@ async def chat_completions(raw_request: Request):
                 payload.pop("tool_choice", None)
             else:
                 payload["tool_choice"] = converted_tc
+        # response_format → text.format（上游不认 response_format，会 400）
+        if "response_format" in payload:
+            _rf_text = _response_format_to_text_format(payload.pop("response_format", None))
+            if _rf_text is not None:
+                _existing_text = payload.get("text")
+                if isinstance(_existing_text, dict):
+                    _existing_text = dict(_existing_text)
+                    _existing_text["format"] = _rf_text["format"]
+                    payload["text"] = _existing_text
+                else:
+                    payload["text"] = _rf_text
         # 移除 Responses API 不支持的 Chat Completions 参数
-        for key in ("reasoning_effort", "n", "frequency_penalty", "presence_penalty", "stop", "user"):
+        for key in ("reasoning_effort", "n", "frequency_penalty", "presence_penalty", "stop", "user", "response_format"):
             payload.pop(key, None)
         _target_url = TARGET_ZEN_RESPONSES_URL
 
@@ -3434,6 +3528,13 @@ async def chat_completions(raw_request: Request):
                     await asyncio.sleep(delay)
                     continue
                 log.warning("Upstream HTTP %s for '%s'; returning error to client.", response.status_code, current_model)
+                if response.status_code == 400 and current_model in RESPONSES_ONLY_MODELS:
+                    try:
+                        log.warning("400-payload model=%s egress=%s keys=%s response_format=%r tool_choice=%r",
+                                    current_model, egress_key, sorted(upstream_payload.keys()),
+                                    upstream_payload.get("response_format"), upstream_payload.get("tool_choice"))
+                    except Exception:
+                        pass
                 if response.status_code == 403 and current_model in RESPONSES_ONLY_MODELS:
                     try:
                         _dump = json.dumps(

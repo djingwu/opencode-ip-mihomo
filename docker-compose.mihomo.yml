@@ -80,6 +80,8 @@ services:
       - UPSTREAM_RPM=${UPSTREAM_RPM:-10}
       - MAX_UPSTREAM_CONCURRENCY=${MAX_UPSTREAM_CONCURRENCY:-1}
       - ANON_SESSION_GAP_SECONDS=${ANON_SESSION_GAP_SECONDS:-600}
+      # 临时诊断日志（req-diag / stream-summary），排查完置 0
+      - REQ_DIAG=${REQ_DIAG:-0}
       # 服务端强制替换下游凭证的上游有效 key（.env 里配，从不进仓库）
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
       - RATE_LIMIT_ROTATION_THRESHOLD=${RATE_LIMIT_ROTATION_THRESHOLD:-2}
