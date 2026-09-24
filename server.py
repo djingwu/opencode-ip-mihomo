@@ -1220,6 +1220,14 @@ def is_free_tier_model(name) -> bool:
 
 CORE_AGENT_TOOLS = ["bash", "edit", "glob", "grep", "read"]
 
+# 假 tools 诱发调用后的续问 steering：下游没有真工具可执行，由代理侧合成
+# 工具结果续问，引导模型直接作答（流/非流共用）
+_FAKE_TOOL_CONTINUE_OUTPUT = (
+    "工具执行环境不可用（缺少必要参数），请直接根据已看到的图片与上下文作答，"
+    "不要再调用工具。/ Tool execution unavailable (missing arguments); answer "
+    "directly from visible context without further tool calls."
+)
+
 TITLE_PROMPT_PREFIX = "Generate a title for this conversation:"
 # 新版标题提示词（system 角色）：固定指令头，可做特征识别
 TITLE_GEN_MARKERS = ("title generator", "thread title")
@@ -1672,8 +1680,13 @@ async def _collect_anthropic_stream(response, model_name: str):
     return await asyncio.to_thread(_collect_anthropic_stream_blocking, response, model_name)
 
 
-async def responses_stream_as_chat(response, model_name: str, session=None, stream_pool_key=None):
-    """将 Responses API 的流式 SSE 事件转为 Chat Completions SSE 格式。"""
+async def responses_stream_as_chat(response, model_name: str, session=None, stream_pool_key=None, followup=None):
+    """将 Responses API 的流式 SSE 事件转为 Chat Completions SSE 格式。
+
+    followup（仅下游无真工具的假 tools 场景传入）：首轮若被诱发出
+    function_call，不向下游播调用块（下游执行不了），而由代理侧合成工具
+    结果续问一轮后继续播最终答案，保证终止。
+    """
     loop = asyncio.get_event_loop()
     pending_sse_event = ""
     message_id = f"chatcmpl-{uuid.uuid4().hex[:20]}"
@@ -1682,6 +1695,10 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
     finish_reason = "stop"
     usage = {}
     tool_call_state = {}
+    done_calls = []
+    saw_completed = False
+    completed_ok = False
+    _depth = 0
 
     def make_chunk(delta: dict, finish: str = None) -> bytes:
         chunk = {
@@ -1756,6 +1773,59 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                 incomplete = resp_data.get("incomplete_details") or {}
                 if status == "incomplete" and incomplete.get("reason") == "max_output_tokens":
                     finish_reason = "length"
+                saw_completed = True
+                completed_ok = (status == "completed")
+                if followup is not None and _depth == 0 and completed_ok and done_calls:
+                    # 假 tools 首轮被诱发调用：代理侧合成工具结果续问一轮，
+                    # 不把调用抛给下游（下游无真工具可执行）
+                    _f_calls = [c for c in done_calls
+                                if isinstance(c, dict) and c.get("type") == "function_call"]
+                    if _f_calls:
+                        log.info("Fake-tool calls %s on '%s' (stream); continuing proxy-side (1 round).",
+                                 [c.get("name") for c in _f_calls], model_name)
+                        _f_payload = {
+                            "model": followup.get("model", model_name),
+                            "stream": True,
+                            "input": list(followup.get("input") or []) + _f_calls + [
+                                {"type": "function_call_output",
+                                 "call_id": c.get("call_id") or c.get("id") or "call_unknown",
+                                 "output": _FAKE_TOOL_CONTINUE_OUTPUT}
+                                for c in _f_calls],
+                        }
+                        if followup.get("tools") is not None:
+                            _f_payload["tools"] = followup["tools"]
+                        _r2 = None
+                        try:
+                            _r2 = await _post_upstream_stream(
+                                session, followup["url"], json_body=_f_payload,
+                                headers=followup.get("headers") or {},
+                                proxies=followup.get("proxies"),
+                                timeout=followup.get("timeout", STREAM_TIMEOUT))
+                        except Exception as exc:
+                            log.warning("Stream follow-up POST failed for '%s': %s", model_name, exc)
+                        if _r2 is not None and getattr(_r2, "status_code", 500) < 400:
+                            try:
+                                response.close()
+                            except Exception:
+                                pass
+                            response = _r2
+                            line_iter = response.iter_lines()
+                            _prefetch = []
+                            tool_call_state = {}
+                            done_calls = []
+                            usage = {}
+                            finish_reason = "stop"
+                            saw_completed = False
+                            completed_ok = False
+                            _depth = 1
+                            continue
+                        if _r2 is not None:
+                            try:
+                                _r2.close()
+                            except Exception:
+                                pass
+                            log.warning("Stream follow-up got HTTP %s for '%s'; ending with text so far.",
+                                        getattr(_r2, "status_code", "?"), model_name)
             elif event_type == "response.output_item.added":
                 item = data.get("item") or {}
                 if item.get("type") == "function_call":
@@ -1766,6 +1836,10 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                         "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:20]}",
                         "name": item.get("name") or "tool",
                     }
+            elif event_type == "response.output_item.done":
+                item = data.get("item") or {}
+                if item.get("type") == "function_call" and (item.get("call_id") or item.get("id")):
+                    done_calls.append(dict(item))
             elif event_type == "response.function_call_arguments.delta":
                 output_index = data.get("output_index", 0)
                 key = data.get("item_id") or output_index
@@ -1777,17 +1851,19 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                         "name": data.get("name") or "tool",
                     }
                     tool_call_state[key] = state
-                yield make_chunk({
-                    "tool_calls": [{
-                        "index": state["index"],
-                        "id": state["id"],
-                        "type": "function",
-                        "function": {
-                            "name": state["name"],
-                            "arguments": data.get("delta", ""),
-                        },
-                    }]
-                })
+                if followup is None or _depth > 0:
+                    yield make_chunk({
+                        "tool_calls": [{
+                            "index": state["index"],
+                            "id": state["id"],
+                            "type": "function",
+                            "function": {
+                                "name": state["name"],
+                                "arguments": data.get("delta", ""),
+                            },
+                        }]
+                    })
+                # 假 tools 首轮调用块不播给下游（执行不了），攒着代理侧续问
             elif event_type == "error":
                 _discard_stream_session = True
                 break
@@ -3476,7 +3552,19 @@ async def chat_completions(raw_request: Request):
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
                     if current_model in RESPONSES_ONLY_MODELS:
-                        inner_gen = responses_stream_as_chat(response, current_model, session=session if stream_borrowed else None, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                        _followup = None
+                        if _fake_tools_only and isinstance(upstream_payload, dict):
+                            # 下游无真工具：假 tools 诱发的调用下游执行不了，
+                            # 由流函数代理侧续问（不播调用块）
+                            _followup = {
+                                "url": _target_url,
+                                "headers": headers,
+                                "proxies": proxies,
+                                "input": upstream_payload.get("input"),
+                                "tools": upstream_payload.get("tools"),
+                                "timeout": MODEL_TIMEOUT_OVERRIDES.get(current_model, STREAM_TIMEOUT),
+                            }
+                        inner_gen = responses_stream_as_chat(response, current_model, session=session if stream_borrowed else None, stream_pool_key=stream_pool_key if stream_borrowed else None, followup=_followup)
                     else:
                         inner_gen = stream_response(response, current_model, session=session, stream_pool_key=stream_pool_key if stream_borrowed else None)
                     stream_gen = _stream_with_history(
@@ -3519,7 +3607,7 @@ async def chat_completions(raw_request: Request):
                                     _follow_input = _follow_input + _round1_calls + [
                                         {"type": "function_call_output",
                                          "call_id": c.get("call_id") or c.get("id") or "call_unknown",
-                                         "output": "工具执行环境不可用（缺少必要参数），请直接根据已看到的图片与上下文作答，不要再调用工具。/ Tool execution unavailable (missing arguments); answer directly from visible context without further tool calls."}
+                                         "output": _FAKE_TOOL_CONTINUE_OUTPUT}
                                         for c in _round1_calls]
                                     _payload2 = dict(upstream_payload) if isinstance(upstream_payload, dict) else {"model": current_model}
                                     _payload2["input"] = _follow_input
