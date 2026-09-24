@@ -2041,7 +2041,7 @@ def _save_proxy_state(st: Dict[str, Any]) -> bool:
 
 
 def list_proxies() -> Dict[str, Any]:
-    """返回代理列表 + 每个代理的状态（延迟/失败次数/冷却至/状态）。"""
+    """返回代理列表 + 每个代理的状态（延迟/失败次数/冷却至/状态/上游配额冷却）。"""
     proxies = _read_proxy_file()
     state = _load_proxy_state()
     now = time.time()
@@ -2056,6 +2056,27 @@ def list_proxies() -> Dict[str, Any]:
         else:
             status = s.get("status", "untested")  # untested / ok / fail
             remain = 0
+        # 上游 429 配额冷却（按模型分 key，未到期才展示）
+        quota_view = {}
+        try:
+            _quota = s.get("quota") if isinstance(s, dict) else None
+            if isinstance(_quota, dict):
+                for _model, _entry in _quota.items():
+                    if not isinstance(_entry, dict):
+                        continue
+                    try:
+                        _until = float(_entry.get("until") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    _remain = _until - now
+                    if _remain > 0:
+                        quota_view[_model] = {
+                            "remain": int(_remain),
+                            "retry_after": _entry.get("retry_after"),
+                            "category": _entry.get("category") or "",
+                        }
+        except Exception:
+            quota_view = {}
         items.append({
             "addr": addr,
             "status": status,
@@ -2063,6 +2084,8 @@ def list_proxies() -> Dict[str, Any]:
             "fail_count": s.get("fail_count", 0),
             "cooldown_until": s.get("cooldown_until", 0),
             "cooldown_remain": remain,
+            "quota": quota_view,
+            "quota_blocked": bool(quota_view),
         })
     return {"proxies": items, "total": len(items)}
 

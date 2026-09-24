@@ -147,7 +147,7 @@ def load_proxy_list():
     if _proxy_pool:
         log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
 
-def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
+def get_next_outbound_proxy(session_key: str = "", model: Optional[str] = None) -> Optional[Dict[str, str]]:
     """Return the current unified egress.
 
     A manual rotation can temporarily hold the route on mihomo while it walks
@@ -157,6 +157,9 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
     If session_key is provided, the proxy is cached per-session so that all
     requests in the same conversation share the same egress.
     New sessions are assigned to idle (unbound) proxies when available.
+    When model is provided, proxies whose upstream quota for that model is
+    still cooling down are skipped (with fallback to unfiltered selection so
+    a fully-blocked pool degrades to previous behavior instead of outage).
     """
     custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
     route = proxy_pool.routing_snapshot()
@@ -165,8 +168,8 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
     if session_key:
         bound_proxy = _session_proxy_get(session_key)
         if bound_proxy:
-            # 检查绑定的代理是否仍可用
-            if proxy_pool.is_proxy_eligible(bound_proxy):
+            # 检查绑定的代理是否仍可用（含该模型的配额冷却）
+            if proxy_pool.is_proxy_eligible(bound_proxy, model=model):
                 if UPSTREAM_API_KEY_OVERRIDE.lower() == "public":
                     # 匿名按会话绑定：活跃会话稳定复用；长间隔后视为新会话，
                     # 换池内下一个出口（分摊各 IP 日配额）
@@ -179,7 +182,7 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
                     if last and now - last > ANON_SESSION_GAP_SECONDS:
                         nxt = None
                         try:
-                            nxt = proxy_pool.next_proxy_after(bound_proxy)
+                            nxt = proxy_pool.next_proxy_after(bound_proxy, model=model)
                         except Exception as exc:
                             log.warning("Anonymous new-session egress advance failed: %s", exc)
                         if nxt and nxt != bound_proxy:
@@ -202,7 +205,11 @@ def get_next_outbound_proxy(session_key: str = "") -> Optional[Dict[str, str]]:
     if session_key:
         with _session_proxy_map_lock:
             bound_proxies = {proxy for proxy, _ in _session_proxy_map.values()}
-        all_eligible = proxy_pool.eligible_proxies()
+        all_eligible = proxy_pool.eligible_proxies(model=model)
+        if not all_eligible and model:
+            # 该模型配额全满时退化为不过滤，保证不断流（行为与原来一致）
+            all_eligible = proxy_pool.eligible_proxies()
+            log.debug(f"Session {session_key[:20]}... all proxies quota-blocked for '{model}'; falling back to unfiltered.")
         if all_eligible:
             # 空闲代理 = 可用但未被任何 session 绑定的
             free_proxies = [p for p in all_eligible if p not in bound_proxies]
@@ -2468,6 +2475,11 @@ async def recover_from_rate_limit(
     """Retry a transient 429 once on the same IP before considering rotation."""
     category, retry_after, _ = classify_upstream_429(response)
     if category == "quota":
+        # 日配额类 429：记下该出口该模型的冷却，供选路和面板使用
+        try:
+            proxy_pool.record_upstream_quota(current_proxy or None, model_name, retry_after, "quota")
+        except Exception as exc:
+            log.warning("Record quota failed: %s", exc)
         return False
     if retry_after is not None and retry_after > LONG_BAN_THRESHOLD_SECONDS:
         if (UPSTREAM_API_KEY_OVERRIDE.lower() == "public" and session_key
@@ -2477,11 +2489,15 @@ async def recover_from_rate_limit(
             # 仍走下面的原逻辑（换 IP 无用，直接透传）。
             nxt = None
             try:
-                nxt = proxy_pool.next_proxy_after(current_proxy or None)
+                nxt = proxy_pool.next_proxy_after(current_proxy or None, model=model_name)
             except Exception as exc:
                 log.warning("Public-mode egress reselect failed: %s", exc)
                 nxt = None
             if nxt and nxt != (current_proxy or None):
+                try:
+                    proxy_pool.record_upstream_quota(current_proxy or None, model_name, retry_after, "long_ban")
+                except Exception as exc:
+                    log.warning("Record quota failed: %s", exc)
                 _session_proxy_set(session_key, nxt)
                 with _anon_egress_lock:
                     _anon_last_seen[session_key] = time.monotonic()
@@ -2503,6 +2519,11 @@ async def recover_from_rate_limit(
             return False
         # key/账号级长封禁（如 retry-after 数小时）：换出口无用，不重试不轮换，
         # 直接返回 False 让调用方把 429 + Retry-After 透给下游退避。
+        # 配额照记（供面板可见；key 模式下选路不依赖它）。
+        try:
+            proxy_pool.record_upstream_quota(current_proxy or None, model_name, retry_after, "long_ban")
+        except Exception as exc:
+            log.warning("Record quota failed: %s", exc)
         log.warning(
             "Long upstream ban for '%s' (retry_after=%ss > %ss); "
             "skipping retry and egress rotation.",
@@ -2514,6 +2535,10 @@ async def recover_from_rate_limit(
     if not rotate_now:
         requested_delay = retry_after if retry_after is not None else 0.0
         delay = min(requested_delay, MAX_RATE_LIMIT_WAIT)
+        try:
+            proxy_pool.record_upstream_quota(current_proxy or None, model_name, retry_after, "rate_limit")
+        except Exception as exc:
+            log.warning("Record quota failed: %s", exc)
         _reset_request_session(endpoint, session, pooled=pooled, stream_pool_key=stream_pool_key)
         log.warning(
             "HTTP 429 for '%s' on %s (streak=%d, retry_after=%s); retaining the egress and retrying in %.2fs.",
@@ -3452,7 +3477,7 @@ async def chat_completions(raw_request: Request):
         # 代理，由下面的长间隔逻辑兜底）
         try:
             _cur = _session_proxy_get(session_key)
-            _nxt = proxy_pool.next_proxy_after(_cur or proxy_pool.active_proxy())
+            _nxt = proxy_pool.next_proxy_after(_cur or proxy_pool.active_proxy(), model=current_model)
             if _nxt and _nxt != _cur:
                 _session_proxy_set(session_key, _nxt)
                 with _anon_egress_lock:
@@ -3469,7 +3494,7 @@ async def chat_completions(raw_request: Request):
         proxies = None
         egress_key = "unknown"
         try:
-            proxies = get_next_outbound_proxy(session_key=session_key)
+            proxies = get_next_outbound_proxy(session_key=session_key, model=current_model)
             egress_key = await pace_egress_request(proxies)
             upstream_payload = payload
             if force_upstream_stream:
@@ -3493,11 +3518,15 @@ async def chat_completions(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
-                category, _, _ = classify_upstream_429(response)
+                category, _quota_retry_after, _ = classify_upstream_429(response)
                 if category == "quota":
                     if stream_borrowed:
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
+                    try:
+                        proxy_pool.record_upstream_quota(_request_proxy_url(proxies), current_model, _quota_retry_after, "quota")
+                    except Exception as exc:
+                        log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, current_model)
                 if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
@@ -3866,7 +3895,7 @@ async def anthropic_messages(raw_request: Request):
         proxies = None
         egress_key = "unknown"
         try:
-            proxies = get_next_outbound_proxy(session_key=session_key)
+            proxies = get_next_outbound_proxy(session_key=session_key, model=model_name)
             egress_key = await pace_egress_request(proxies)
             upstream_body = body
             if force_upstream_stream:
@@ -3891,11 +3920,15 @@ async def anthropic_messages(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
-                category, _, _ = classify_upstream_429(response)
+                category, _quota_retry_after, _ = classify_upstream_429(response)
                 if category == "quota":
                     if stream_borrowed:
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
+                    try:
+                        proxy_pool.record_upstream_quota(_request_proxy_url(proxies), model_name, _quota_retry_after, "quota")
+                    except Exception as exc:
+                        log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
                 if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
@@ -4034,7 +4067,7 @@ async def responses_endpoint(raw_request: Request):
         proxies = None
         egress_key = "unknown"
         try:
-            proxies = get_next_outbound_proxy(session_key=session_key)
+            proxies = get_next_outbound_proxy(session_key=session_key, model=model_name)
             egress_key = await pace_egress_request(proxies)
             upstream_body = body
             if force_upstream_stream:
@@ -4058,11 +4091,15 @@ async def responses_endpoint(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
-                category, _, _ = classify_upstream_429(response)
+                category, _quota_retry_after, _ = classify_upstream_429(response)
                 if category == "quota":
                     if stream_borrowed:
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
+                    try:
+                        proxy_pool.record_upstream_quota(_request_proxy_url(proxies), model_name, _quota_retry_after, "quota")
+                    except Exception as exc:
+                        log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
                 if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False

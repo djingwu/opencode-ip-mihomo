@@ -1316,6 +1316,20 @@
             return `${d.getMonth()+1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
         }
 
+        function formatQuota(quota) {
+            // quota: {model: {remain(秒), category}} → "配额冷却 · muse… 9h52m"
+            if (!quota) return '';
+            const fmt = s => {
+                s = Math.max(0, Math.floor(s));
+                if (s >= 3600) return Math.floor(s / 3600) + 'h' + Math.floor(s % 3600 / 60) + 'm';
+                if (s >= 60) return Math.floor(s / 60) + 'm' + (s % 60) + 's';
+                return s + 's';
+            };
+            return '配额冷却 · ' + Object.entries(quota).slice(0, 3).map(([m, q]) =>
+                `${escapeHtml(m.length > 18 ? m.slice(0, 18) + '…' : m)} ${fmt(q.remain || 0)}`
+            ).join('，');
+        }
+
         async function loadProxyRouteStatus() {
             const el = document.getElementById('proxy-route-msg');
             if (!el) return;
@@ -1351,7 +1365,7 @@
                     const latClass = (p.latency !== null && p.latency !== undefined && p.latency < 500) ? 'text-emerald-600' : 'text-slate-600';
                     return `<tr class="hover:bg-slate-50/60 transition-colors">
                         <td class="px-5 py-2.5 font-mono text-slate-800 max-w-[340px] truncate" title="${escapeHtml(p.addr)}">${escapeHtml(p.addr)}</td>
-                        <td class="px-5 py-2.5">${proxyStatusBadge(p.status)}${p.status === 'cooldown' && p.cooldown_remain ? `<span class="ml-1 text-[10px] text-amber-500">${p.cooldown_remain}s</span>` : ''}</td>
+                        <td class="px-5 py-2.5">${proxyStatusBadge(p.status)}${p.status === 'cooldown' && p.cooldown_remain ? `<span class="ml-1 text-[10px] text-amber-500">${p.cooldown_remain}s</span>` : ''}${p.quota_blocked ? `<div class="mt-1 text-[10px] text-orange-500 font-mono">${formatQuota(p.quota)}</div>` : ''}</td>
                         <td class="px-5 py-2.5 text-right font-mono ${latClass}">${latency}</td>
                         <td class="px-5 py-2.5 text-right text-slate-500 font-mono">${p.fail_count}</td>
                         <td class="px-5 py-2.5 text-slate-400 font-mono">${formatCooldown(p.cooldown_until)}</td>

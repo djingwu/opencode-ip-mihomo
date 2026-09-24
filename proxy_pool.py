@@ -21,6 +21,8 @@ EGRESS_STATE_FILE = Path(os.environ.get("EGRESS_STATE_FILE", "/app/data/egress_s
 PROXY_COOLDOWN_BASE = int(os.environ.get("PROXY_COOLDOWN_BASE", "60"))
 PROXY_COOLDOWN_FACTOR = int(os.environ.get("PROXY_COOLDOWN_FACTOR", "30"))
 PROXY_LATENCY_THRESHOLD_MS = int(os.environ.get("PROXY_LATENCY_THRESHOLD_MS", "300"))
+# 上游 429 配额缺省冷却（秒）：上游没给 retry-after 时用它；给了就按上游的来
+UPSTREAM_QUOTA_DEFAULT_TTL = max(1, int(os.environ.get("UPSTREAM_QUOTA_DEFAULT_TTL", "60")))
 # 选路文件读缓存（秒）：proxies.txt/proxy_state.json/egress_state.json 按 mtime 失效。
 # 三个进程共享 ./data 卷，但这些文件由面板/轮换低频写，热路径读缓存 1s 足够；
 # 写路径每次清缓存，保证切换出口后最多 1s 可见。
@@ -134,17 +136,112 @@ def _cooldown_until(state: Dict[str, Any], proxy: str) -> float:
         return 0.0
 
 
-def is_proxy_eligible(proxy: str, state: Optional[Dict[str, Any]] = None, now: Optional[float] = None) -> bool:
+def is_proxy_eligible(proxy: str, state: Optional[Dict[str, Any]] = None, now: Optional[float] = None, model: Optional[str] = None) -> bool:
     state = state if state is not None else read_proxy_state()
     now = time.time() if now is None else now
-    return _cooldown_until(state, proxy) <= now
+    if _cooldown_until(state, proxy) > now:
+        return False
+    if model and quota_remaining(proxy, model, state, now) > 0:
+        return False
+    return True
 
 
-def eligible_proxies(proxies: Optional[Iterable[str]] = None) -> List[str]:
+def eligible_proxies(proxies: Optional[Iterable[str]] = None, model: Optional[str] = None) -> List[str]:
     values = list(proxies) if proxies is not None else read_proxy_list()
     state = read_proxy_state()
     now = time.time()
-    return [proxy for proxy in values if is_proxy_eligible(proxy, state, now)]
+    return [proxy for proxy in values if is_proxy_eligible(proxy, state, now, model)]
+
+
+def _quota_map(state: Dict[str, Any], proxy: str) -> Dict[str, Any]:
+    value = state.get(proxy, {})
+    if not isinstance(value, dict):
+        return {}
+    quota = value.get("quota")
+    return quota if isinstance(quota, dict) else {}
+
+
+def quota_remaining(proxy: str, model: str, state: Optional[Dict[str, Any]] = None, now: Optional[float] = None) -> float:
+    """Return seconds until this proxy regains quota for the model (0 = free)."""
+    if not proxy or not model:
+        return 0.0
+    state = state if state is not None else read_proxy_state()
+    now = time.time() if now is None else now
+    entry = _quota_map(state, proxy).get(model)
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        return max(0.0, float(entry.get("until") or 0) - now)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def quota_view(proxy: str, state: Optional[Dict[str, Any]] = None, now: Optional[float] = None) -> Dict[str, Any]:
+    """Unexpired per-model quota entries for panel display: {model: {until, remain, retry_after, category}}."""
+    state = state if state is not None else read_proxy_state()
+    now = time.time() if now is None else now
+    view: Dict[str, Any] = {}
+    for model, entry in _quota_map(state, proxy).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            until = float(entry.get("until") or 0)
+        except (TypeError, ValueError):
+            continue
+        remain = until - now
+        if remain <= 0:
+            continue
+        view[model] = {
+            "until": until,
+            "remain": remain,
+            "retry_after": entry.get("retry_after"),
+            "category": entry.get("category") or "",
+        }
+    return view
+
+
+def record_upstream_quota(proxy: Optional[str], model: Optional[str], retry_after=None, category: str = "") -> bool:
+    """Persist an upstream 429 quota window for (proxy, model).
+
+    Quota is time-based: it lifts itself on expiry, so request successes must
+    NOT clear it (a blocked proxy receives no traffic for that model anyway).
+    Expired entries are pruned lazily on write. Returns True if stored.
+    """
+    if not proxy or not model:
+        return False
+    proxy = normalize_proxy_url(proxy)
+    now = time.time()
+    try:
+        ttl = max(0, int(float(retry_after))) if retry_after is not None else UPSTREAM_QUOTA_DEFAULT_TTL
+    except (TypeError, ValueError):
+        ttl = UPSTREAM_QUOTA_DEFAULT_TTL
+    if ttl <= 0:
+        return False
+    state = read_proxy_state()
+    entry = state.get(proxy)
+    if not isinstance(entry, dict):
+        entry = {}
+        state[proxy] = entry
+    quota = entry.get("quota")
+    if not isinstance(quota, dict):
+        quota = {}
+        entry["quota"] = quota
+    stale = []
+    for m, q in quota.items():
+        try:
+            if not isinstance(q, dict) or float(q.get("until") or 0) <= now:
+                stale.append(m)
+        except (TypeError, ValueError):
+            stale.append(m)
+    for m in stale:
+        quota.pop(m, None)
+    quota[model] = {
+        "until": now + ttl,
+        "retry_after": ttl,
+        "category": category or "",
+        "updated_at": int(now),
+    }
+    return write_proxy_state(state)
 
 
 def active_proxy() -> Optional[str]:
@@ -242,12 +339,12 @@ def select_active_proxy(proxies: Optional[Iterable[str]] = None) -> Optional[str
     return available[0]
 
 
-def next_proxy_after(current: Optional[str], proxies: Optional[Iterable[str]] = None) -> Optional[str]:
+def next_proxy_after(current: Optional[str], proxies: Optional[Iterable[str]] = None, model: Optional[str] = None) -> Optional[str]:
     values = list(proxies) if proxies is not None else read_proxy_list()
     values = list(dict.fromkeys(normalize_proxy_url(value) for value in values if value))
     if not values:
         return None
-    available = eligible_proxies(values)
+    available = eligible_proxies(values, model)
     if not available:
         return None
     if current in values:
