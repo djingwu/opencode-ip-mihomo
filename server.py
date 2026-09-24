@@ -1743,6 +1743,10 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
     _depth = 0
     _text_len = 0
     _text_head = ""
+    # 上游 output_index 含 reasoning/message 项（工具调用可能是 2 甚至更大），
+    # 下游 OpenAI 协议要求 tool_calls index 从 0 连续编号，否则 AI SDK 解析
+    # 成稀疏数组、调用丢失导致客户端停住。这里按出现顺序重编号。
+    _next_tool_index = 0
 
     def make_chunk(delta: dict, finish: str = None) -> bytes:
         chunk = {
@@ -1868,6 +1872,7 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                             _depth = 1
                             _text_len = 0
                             _text_head = ""
+                            _next_tool_index = 0
                             continue
                         if _r2 is not None:
                             try:
@@ -1882,10 +1887,12 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                     output_index = data.get("output_index", 0)
                     key = item.get("id") or output_index
                     tool_call_state[key] = {
-                        "index": output_index,
+                        "index": _next_tool_index,
+                        "upstream_index": output_index,
                         "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:20]}",
                         "name": item.get("name") or "tool",
                     }
+                    _next_tool_index += 1
             elif event_type == "response.output_item.done":
                 item = data.get("item") or {}
                 if item.get("type") == "function_call" and (item.get("call_id") or item.get("id")):
@@ -1896,10 +1903,12 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                 state = tool_call_state.get(key) or tool_call_state.get(output_index)
                 if not state:
                     state = {
-                        "index": output_index,
+                        "index": _next_tool_index,
+                        "upstream_index": output_index,
                         "id": data.get("call_id") or data.get("item_id") or f"call_{uuid.uuid4().hex[:20]}",
                         "name": data.get("name") or "tool",
                     }
+                    _next_tool_index += 1
                     tool_call_state[key] = state
                 if followup is None:
                     yield make_chunk({
@@ -1926,8 +1935,9 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
             # 续问的最终轮仍只调工具没文本：给一句兜底，避免下游只见首轮前言
             yield make_chunk({"content": "（本轮未能完成分析，请重试或补充说明。）"})
         if REQ_DIAG_ENABLED:
-            log.info("stream-summary model=%s depth=%d text_len=%d head=%r calls=%d finish=%s completed=%s",
-                     model_name, _depth, _text_len, _text_head, len(done_calls), finish_reason, saw_completed)
+            log.info("stream-summary model=%s depth=%d text_len=%d head=%r calls=%d names=%s finish=%s completed=%s",
+                     model_name, _depth, _text_len, _text_head, len(done_calls),
+                     [c.get("name") for c in done_calls], finish_reason, saw_completed)
         yield make_chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
 
