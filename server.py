@@ -1821,24 +1821,43 @@ def _convert_responses_to_chat(resp: dict, model_name: str) -> dict:
     """
     output = resp.get("output", [])
     reasoning_text = ""
-    message_text = ""
+    message_texts = []
+    tool_calls_out = []
     for item in output:
         if item.get("type") == "reasoning":
             reasoning_text = item.get("encrypted_content", "") or ""
         elif item.get("type") == "message":
             for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    message_text = c.get("text", "")
+                if c.get("type") == "output_text" and c.get("text"):
+                    message_texts.append(c["text"])
+                elif c.get("type") == "refusal" and c.get("refusal"):
+                    message_texts.append(c["refusal"])
+        elif item.get("type") == "function_call":
+            # 上游（尤其被 shim 假 tools 诱发的视觉请求）可能带工具调用；
+            # 必须透传给下游走 agent 循环，否则下游只见前言文本就停住。
+            tool_calls_out.append({
+                "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:20]}",
+                "type": "function",
+                "function": {
+                    "name": item.get("name") or "tool",
+                    "arguments": item.get("arguments") if isinstance(item.get("arguments"), str) else json.dumps(item.get("arguments") or {}, ensure_ascii=False),
+                },
+            })
+    message_text = "".join(message_texts)
 
     status = resp.get("status", "completed")
     incomplete = resp.get("incomplete_details") or {}
-    if status == "incomplete":
+    if tool_calls_out:
+        finish_reason = "tool_calls"
+    elif status == "incomplete":
         reason = incomplete.get("reason", "")
         finish_reason = "length" if reason == "max_output_tokens" else "stop"
     else:
         finish_reason = "stop"
 
     message = {"role": "assistant", "content": message_text}
+    if tool_calls_out:
+        message["tool_calls"] = tool_calls_out
     if reasoning_text:
         message["reasoning"] = reasoning_text
 
