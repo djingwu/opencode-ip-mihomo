@@ -342,6 +342,26 @@ def _subscription_source_url(name: str, provider: Dict[str, Any], state: Dict[st
     return str(provider.get("url") or sources.get(name) or "").strip()
 
 
+def _download_subscription_payload(name: str, url: str) -> Dict[str, Any]:
+    """纯下载+解码（无共享状态变更），可在锁外并发执行。"""
+    if not url.startswith(("http://", "https://")):
+        return {"name": name, "ok": False, "error": "缺少有效订阅链接"}
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": DEFAULT_UA, "Accept": "*/*"},
+            timeout=30,
+            impersonate="chrome124",
+        )
+        if response.status_code != 200:
+            return {"name": name, "ok": False, "error": f"订阅返回 HTTP {response.status_code}"}
+        normalized, fmt = _decode_subscription_payload(response.content)
+        return {"name": name, "ok": True, "format": fmt, "url": url, "content": normalized}
+    except Exception as exc:
+        log.warning("subscription %s refresh failed: %s", name, exc)
+        return {"name": name, "ok": False, "error": str(exc)}
+
+
 def _fetch_and_cache_subscription(name: str, provider: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     url = _subscription_source_url(name, provider, state)
     if not url.startswith(("http://", "https://")):
@@ -385,12 +405,68 @@ def _fetch_and_cache_subscription(name: str, provider: Dict[str, Any], state: Di
 
 def refresh_subscriptions(names: Optional[List[str]] = None) -> Dict[str, Any]:
     """手动抓取并缓存订阅，再热重载 mihomo。"""
+    # 快照阶段（短锁）：只读配置与 URL，不做网络 IO
+    with _lock:
+        cfg_snapshot = load_config() or {}
+        providers_snapshot = cfg_snapshot.get("proxy-providers", {}) or {}
+        state_snapshot = load_state()
+        targets = [name for name in (names or list(providers_snapshot.keys())) if name in providers_snapshot and name != FREE_PROVIDER_NAME]
+        url_map = {}
+        for name in targets:
+            prov = providers_snapshot.get(name)
+            if isinstance(prov, dict):
+                url_map[name] = _subscription_source_url(name, prov, state_snapshot)
+    # 下载阶段（无锁并发）：原来持全局 _lock 串行下载 N*30s，阻塞所有面板读；
+    # 改为锁外线程池并发，单订阅仍 30s 超时，总耗时约等于最慢的一个。
+    downloaded: Dict[str, Dict[str, Any]] = {}
+    if url_map:
+        workers = max(1, min(8, len(url_map)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="panel-sub-dl") as executor:
+            future_map = {executor.submit(_download_subscription_payload, name, url): name for name, url in url_map.items()}
+            for future in as_completed(future_map):
+                name = future_map[future]
+                try:
+                    downloaded[name] = future.result()
+                except Exception as exc:
+                    downloaded[name] = {"name": name, "ok": False, "error": str(exc)}
+    # 落盘阶段（短锁）：重新加载最新配置后合并，避免下载期间的其他写入丢失
     with _lock:
         cfg = load_config() or {}
         providers = cfg.get("proxy-providers", {}) or {}
         state = load_state()
-        targets = [name for name in (names or list(providers.keys())) if name in providers and name != FREE_PROVIDER_NAME]
-        results = [_fetch_and_cache_subscription(name, providers[name], state) for name in targets if isinstance(providers[name], dict)]
+        results = []
+        for name in targets:
+            prov = providers.get(name)
+            if not isinstance(prov, dict):
+                results.append({"name": name, "ok": False, "error": "订阅已不存在"})
+                continue
+            dl = downloaded.get(name, {"name": name, "ok": False, "error": "未下载"})
+            if not dl.get("ok"):
+                results.append(dl)
+                continue
+            try:
+                path = _resolve_provider_file(prov)
+                if not path:
+                    path = MIHOMO_CONFIG_DIR / "providers" / f"{name}.yaml"
+                    prov["path"] = f"./providers/{name}.yaml"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(dl["content"], encoding="utf-8")
+                health_check = prov.get("health-check") or {
+                    "enable": True,
+                    "interval": 300,
+                    "url": HEALTH_CHECK_URL,
+                }
+                prov.clear()
+                prov.update({
+                    "type": "file",
+                    "path": f"./providers/{name}.yaml",
+                    "health-check": health_check,
+                })
+                state.setdefault("subscription_urls", {})[name] = dl["url"]
+                state.setdefault("subscription_meta", {})[name] = {"format": dl["format"], "updated_at": int(time.time())}
+                results.append({"name": name, "ok": True, "format": dl["format"], "url": dl["url"], "path": str(path)})
+            except Exception as exc:
+                results.append({"name": name, "ok": False, "error": str(exc)})
         if not save_config(cfg):
             return {"ok": False, "error": "配置写入失败", "results": results}
         # “删除节点”只影响当前节点管理视图；手动刷新订阅/节点列表后，
@@ -2154,9 +2230,23 @@ def check_proxies(addrs: Optional[List[str]] = None) -> Dict[str, Any]:
         targets = proxies
     state = _load_proxy_state()
     now = time.time()
+    # 并发探测：原来串行 for + 每次 timeout=8s，N 个代理最慢 N*8s；
+    # 改为线程池并发（复用 LATENCY_WORKERS），失败不阻塞其他节点。
+    probed: Dict[str, Dict[str, Any]] = {}
+    if targets:
+        workers = max(1, min(LATENCY_WORKERS, len(targets)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="panel-proxy-check") as executor:
+            future_map = {executor.submit(_test_one_proxy, addr): addr for addr in targets}
+            for future in as_completed(future_map):
+                addr = future_map[future]
+                try:
+                    probed[addr] = future.result()
+                except Exception as exc:
+                    log.debug("proxy test %s failed: %s", addr, exc)
+                    probed[addr] = {"ok": False, "latency": None}
     results = []
     for addr in targets:
-        res = _test_one_proxy(addr)
+        res = probed.get(addr, {"ok": False, "latency": None})
         s = state.setdefault(addr, {"fail_count": 0})
         if res["ok"]:
             s["status"] = "ok"

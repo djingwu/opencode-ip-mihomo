@@ -59,7 +59,7 @@ MODEL_TIMEOUT_OVERRIDES = {
 # short connection tests while allowing deployments to override the floor.
 ANTHROPIC_MIN_MAX_TOKENS = max(0, int(os.environ.get("ANTHROPIC_MIN_MAX_TOKENS", "128")))
 FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
-FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
+FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "30"))
 # SSE 批量取行：原来每行一次 run_in_executor，1 核机上全是 GIL 切换开销
 STREAM_FETCH_BATCH = max(1, int(os.environ.get("STREAM_FETCH_BATCH", "32")))
 
@@ -176,7 +176,11 @@ def get_next_outbound_proxy(session_key: str = "", model: Optional[str] = None) 
                     now = time.monotonic()
                     with _anon_egress_lock:
                         if len(_anon_last_seen) >= SESSION_CACHE_MAX_KEYS and session_key not in _anon_last_seen:
-                            _anon_last_seen.clear()
+                            # O(1) 淘汰一个而非全清，避免满时所有会话同时重绑造成抖动
+                            try:
+                                _anon_last_seen.pop(next(iter(_anon_last_seen)), None)
+                            except StopIteration:
+                                pass
                         last = _anon_last_seen.get(session_key, 0.0)
                         _anon_last_seen[session_key] = now
                     if last and now - last > ANON_SESSION_GAP_SECONDS:
@@ -351,7 +355,19 @@ _metrics_flush_stop = threading.Event()
 _metrics_flush_thread_started = False
 
 
-def _prune_request_history() -> None:
+_prune_counter = 0
+_prune_counter_lock = threading.Lock()
+
+
+def _prune_request_history(force: bool = False) -> None:
+    # 每 6 次 flush（约 60s）才做一次重 DELETE，避免每 10s 全表扫描；
+    # 强制模式供启动/手动调用。
+    global _prune_counter
+    if not force:
+        with _prune_counter_lock:
+            _prune_counter += 1
+            if _prune_counter % 6 != 0:
+                return
     try:
         cutoff = time.strftime(
             "%Y-%m-%d %H:%M:%S",
@@ -361,11 +377,26 @@ def _prune_request_history() -> None:
             "DELETE FROM request_history WHERE created_at < ? OR timestamp < ?",
             (cutoff, cutoff),
         )
-        _db_execute(
-            "DELETE FROM request_history WHERE id NOT IN "
-            "(SELECT id FROM request_history ORDER BY id DESC LIMIT ?)",
-            (REQUEST_HISTORY_MAX_ROWS,),
-        )
+        # 用 id 上界删除替代 NOT IN SELECT 全表排序：O(logN) 而非 O(N logN)
+        try:
+            with _db_lock:
+                conn = _get_conn()
+                try:
+                    row = conn.execute("SELECT MAX(id) FROM request_history").fetchone()
+                finally:
+                    conn.close()
+            max_id = int(row[0]) if row and row[0] is not None else 0
+            if max_id > REQUEST_HISTORY_MAX_ROWS:
+                _db_execute(
+                    "DELETE FROM request_history WHERE id <= ?",
+                    (max_id - REQUEST_HISTORY_MAX_ROWS,),
+                )
+        except Exception:
+            _db_execute(
+                "DELETE FROM request_history WHERE id NOT IN "
+                "(SELECT id FROM request_history ORDER BY id DESC LIMIT ?)",
+                (REQUEST_HISTORY_MAX_ROWS,),
+            )
     except Exception:
         pass
 
@@ -490,6 +521,14 @@ def init_db():
     _db_execute(
         "CREATE INDEX IF NOT EXISTS idx_request_history_created "
         "ON request_history(created_at)"
+    )
+    _db_execute(
+        "CREATE INDEX IF NOT EXISTS idx_request_history_timestamp "
+        "ON request_history(timestamp)"
+    )
+    _db_execute(
+        "CREATE INDEX IF NOT EXISTS idx_active_flow_leases_expires "
+        "ON active_flow_leases(expires_at)"
     )
     _db_execute("""
         CREATE TABLE IF NOT EXISTS global_counters (
@@ -709,6 +748,8 @@ def _get_session(endpoint: str):
 _stream_pool: Dict[str, list] = {}
 _stream_pool_lock = threading.Lock()
 STREAM_POOL_SIZE = max(1, int(os.environ.get("STREAM_POOL_SIZE", "2")))
+# 全局 key 上限：egress_key 可随代理/会话增长，无上限会导致内存泄漏；超限淘汰最早 key
+STREAM_POOL_MAX_KEYS = max(8, int(os.environ.get("STREAM_POOL_MAX_KEYS", "32")))
 
 
 def _stream_pool_key(endpoint: str, egress_key: str) -> str:
@@ -746,6 +787,11 @@ def _release_stream_session(pool_key: str, session, discard: bool = False) -> No
             pass
         return
     with _stream_pool_lock:
+        if pool_key not in _stream_pool and len(_stream_pool) >= STREAM_POOL_MAX_KEYS:
+            try:
+                _stream_pool.pop(next(iter(_stream_pool)), None)
+            except StopIteration:
+                pass
         bucket = _stream_pool.setdefault(pool_key, [])
         if len(bucket) < STREAM_POOL_SIZE:
             bucket.append(session)
@@ -2064,10 +2110,11 @@ def _session_proxy_get(session_key: str):
 def _session_proxy_set(session_key: str, proxy_url: str) -> None:
     with _session_proxy_map_lock:
         if len(_session_proxy_map) >= SESSION_CACHE_MAX_KEYS and session_key not in _session_proxy_map:
-            # 淘汰最早过期的一个，避免无脑 pop 影响热 key
-            oldest_key = min(_session_proxy_map, key=lambda k: _session_proxy_map[k][1], default=None)
-            if oldest_key is not None:
-                _session_proxy_map.pop(oldest_key, None)
+            # O(1) FIFO 淘汰最早插入的 key：dict 保持插入序，避免 min() 全表 O(N) 扫描
+            try:
+                _session_proxy_map.pop(next(iter(_session_proxy_map)), None)
+            except StopIteration:
+                pass
         _session_proxy_map[session_key] = (proxy_url, time.monotonic() + SESSION_PROXY_TTL_SECONDS)
 
 
@@ -2840,13 +2887,15 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 chunk_count += 1
                 yield b"\n"
                 continue
-            if is_done_sentinel(line):
+            # 单次解析复用：inspect_line 内部已调 _parse_stream_event，直接用 event_type
+            # 判 __done__，避免 is_done_sentinel() 对同一行二次 json.loads
+            _ev, _, _delta = inspect_line(line)
+            if _ev == "__done__":
                 continue
             chunk_count += 1
             if is_anthropic_api:
-                _, _, delta = inspect_line(line)
-                if delta:
-                    yield anthropic_delta_event(delta)
+                if _delta:
+                    yield anthropic_delta_event(_delta)
             else:
                 yield line + b"\n"
 
@@ -2861,8 +2910,9 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 chunk_count += 1
                 yield b"\n"
                 continue
-            _, _, delta = inspect_line(item)
-            if is_done_sentinel(item):
+            _ev, _, delta = inspect_line(item)
+            # 同上：复用本次解析结果判 __done__，省一次 json.loads
+            if _ev == "__done__":
                 continue
             chunk_count += 1
             if is_anthropic_api:
