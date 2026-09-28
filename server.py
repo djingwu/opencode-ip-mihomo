@@ -1800,6 +1800,7 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
     # 下游 OpenAI 协议要求 tool_calls index 从 0 连续编号，否则 AI SDK 解析
     # 成稀疏数组、调用丢失导致客户端停住。这里按出现顺序重编号。
     _next_tool_index = 0
+    _emitted_ids = set()
 
     def make_chunk(delta: dict, finish: str = None) -> bytes:
         chunk = {
@@ -1880,11 +1881,18 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                     finish_reason = "length"
                 saw_completed = True
                 completed_ok = (status == "completed")
-                if followup is not None and _depth == 0 and completed_ok and done_calls:
+                if followup is not None and _depth == 0 and completed_ok and (done_calls or tool_call_state):
                     # 假 tools 首轮被诱发调用：代理侧合成工具结果续问一轮，
                     # 不把调用抛给下游（下游无真工具可执行）
                     _f_calls = [c for c in done_calls
                                 if isinstance(c, dict) and c.get("type") == "function_call"]
+                    if not _f_calls:
+                        # done 事件缺失兜底：用 added/delta 建的状态合成调用
+                        for _st in tool_call_state.values():
+                            _f_calls.append({"type": "function_call",
+                                             "call_id": _st.get("id"),
+                                             "name": _st.get("name") or "tool",
+                                             "arguments": "{}"})
                     if _f_calls:
                         log.info("Fake-tool calls %s on '%s' (stream); continuing proxy-side (1 round).",
                                  [c.get("name") for c in _f_calls], model_name)
@@ -1926,6 +1934,7 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                             _text_len = 0
                             _text_head = ""
                             _next_tool_index = 0
+                            _emitted_ids = set()
                             continue
                         if _r2 is not None:
                             try:
@@ -1975,12 +1984,41 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                             },
                         }]
                     })
+                    _emitted_ids.add(state["id"])
                 # 假 tools 场景（followup 非空）：调用块一律不播给下游
                 #（下游没有真工具，执行不了会卡死），首轮攒着代理侧续问
             elif event_type == "error":
                 _discard_stream_session = True
                 break
 
+        # 兜底：调用已知但零 chunk 播出（如无参数 delta）时合成播出，
+        # 否则 finish=tool_calls 却无调用数据，下游无法执行而停住
+        if followup is None:
+            for _c in done_calls:
+                if not (isinstance(_c, dict) and _c.get("type") == "function_call"):
+                    continue
+                _cid = _c.get("call_id") or _c.get("id")
+                if not _cid or _cid in _emitted_ids:
+                    continue
+                _st = None
+                for _s in tool_call_state.values():
+                    if _s.get("id") == _cid:
+                        _st = _s
+                        break
+                if _st is None:
+                    _st = {"index": _next_tool_index, "id": _cid,
+                           "name": _c.get("name") or "tool"}
+                    _next_tool_index += 1
+                    tool_call_state[_cid] = _st
+                _args = _c.get("arguments")
+                if not isinstance(_args, str):
+                    _args = json.dumps(_args if isinstance(_args, (dict, list)) else {},
+                                        ensure_ascii=False)
+                yield make_chunk({"tool_calls": [{
+                    "index": _st["index"], "id": _st["id"], "type": "function",
+                    "function": {"name": _c.get("name") or _st.get("name") or "tool",
+                                 "arguments": _args}}]})
+                _emitted_ids.add(_cid)
         # 发 finish chunk（带过工具调用时 finish 必须为 tool_calls，否则下游忽略调用直接停住）
         if tool_call_state and finish_reason == "stop" and followup is None:
             finish_reason = "tool_calls"
