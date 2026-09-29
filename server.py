@@ -983,7 +983,7 @@ def start_egress_watcher() -> None:
     _egress_watch_started = True
     threading.Thread(target=_egress_watch_loop, name="egress-watcher", daemon=True).start()
 
-def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0):
+def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0, count_request: bool = True):
     global model_usage_stats
     pricing = MODEL_PRICING.get(model_name, {"input_per_1m": 0.20, "output_per_1m": 0.80})
     prompt_cost = (prompt_tokens / 1_000_000) * pricing["input_per_1m"]
@@ -996,7 +996,10 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
                 "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                 "total_tokens": 0, "estimated_cost_usd": 0.0
             }
-        model_usage_stats[model_name]["requests"] += 1
+        # 流式请求在开始时已用估算记过一次 requests，结束时只补真实 token，
+        # 否则每个流式请求被数两次请求数（count_request=False）
+        if count_request:
+            model_usage_stats[model_name]["requests"] += 1
         model_usage_stats[model_name]["prompt_tokens"] += prompt_tokens
         model_usage_stats[model_name]["completion_tokens"] += completion_tokens
         model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
@@ -1005,7 +1008,7 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
     # 热路径只入队，后台线程批量刷盘；内存统计已实时更新，/metrics 不依赖本条落盘
     try:
         _pending_usage_rows.append(
-            (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost)
+            (model_name, 1 if count_request else 0, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost)
         )
     except Exception:
         pass
@@ -2047,6 +2050,7 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                 model_name,
                 prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
                 completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+                count_request=False,  # 流开始时已计数，这里只补真实 token
             )
     finally:
         if session is not None:
@@ -3808,9 +3812,13 @@ async def chat_completions(raw_request: Request):
                         inner_gen, model=current_model, proxies=proxies,
                         egress_key=egress_key, start_time=start_time, attempt=attempt,
                     )
-                    # 流式只记一条 history（包装器播完才写）；token 先按估算记一次，
-                    # 真实 usage 由 responses 转换函数在 completion 事件里再记（幂等聚合）
-                    track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                    # 流式只记一条 history（包装器播完才写）；responses 模型结束时有
+                    # 真实 usage 回调补记（count_request=False，不重数），这里只计请求数；
+                    # chat 协议流没有结束回调，沿用原来的一次性估算。
+                    if current_model in RESPONSES_ONLY_MODELS:
+                        track_token_usage(current_model, prompt_tokens=0, completion_tokens=0)
+                    else:
+                        track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
                     return StreamingResponse(
                         stream_gen,
                         media_type="text/event-stream",
