@@ -911,6 +911,7 @@ MODEL_PRICING = {
     "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
     "hy3-free": {"input_per_1m": 0.15, "output_per_1m": 0.50},
     "muse-spark-1.2-contributor-free": {"input_per_1m": 0.10, "output_per_1m": 0.40},
+    "muse-spark-1.3-contributor-free": {"input_per_1m": 0.10, "output_per_1m": 0.40},
     "nemotron-3.5-lightning-free": {"input_per_1m": 0.18, "output_per_1m": 0.60},
 }
 
