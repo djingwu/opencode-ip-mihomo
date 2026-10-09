@@ -2213,6 +2213,58 @@ def _session_proxy_pop(session_key: str) -> None:
     with _session_proxy_map_lock:
         _session_proxy_map.pop(session_key, None)
 
+
+# --- 空流换出口 -------------------------------------------------------------
+# 上游偶发回空流（如 space-bunny 06:33 连空 8 次）：空流重试原来固定走同一出口
+#（会话亲和），坏窗口里 4 次必全灭。这里按会话累计连续空流，达到阈值就把绑定
+# 推进到池内下一个出口，重试打散；任一次成功即清零。只影响强制流式聚合路径
+#（下游非流），下游流式请求不在重试循环内，不涉及。
+EMPTY_STREAM_ROTATE_THRESHOLD = max(1, int(os.environ.get("EMPTY_STREAM_ROTATE_THRESHOLD", "2")))
+EMPTY_STREAM_ROTATE_ENABLED = os.environ.get("EMPTY_STREAM_ROTATE", "true").lower() in ("true", "1", "yes")
+_empty_stream_strikes: Dict[str, int] = {}
+_empty_stream_strikes_lock = threading.Lock()
+
+
+def _note_empty_stream(session_key: str, model: str) -> None:
+    """记录一次空流；连续达到阈值时将会话绑定推进到下一个出口。"""
+    if not EMPTY_STREAM_ROTATE_ENABLED or not session_key:
+        return
+    with _empty_stream_strikes_lock:
+        if len(_empty_stream_strikes) >= SESSION_CACHE_MAX_KEYS and session_key not in _empty_stream_strikes:
+            try:
+                _empty_stream_strikes.pop(next(iter(_empty_stream_strikes)), None)
+            except StopIteration:
+                pass
+        strikes = _empty_stream_strikes.get(session_key, 0) + 1
+        _empty_stream_strikes[session_key] = strikes
+    if strikes < EMPTY_STREAM_ROTATE_THRESHOLD:
+        return
+    try:
+        cur = _session_proxy_get(session_key) or proxy_pool.active_proxy()
+        nxt = proxy_pool.next_proxy_after(cur, model=model)
+        if nxt and nxt != cur:
+            _session_proxy_set(session_key, nxt)
+            log.warning("Consecutive empty streams x%s for '%s'; egress %s -> %s.",
+                        strikes, model, cur, nxt)
+        else:
+            # 池内无其他可用出口：解绑让下次重选（可能回到同一出口）
+            _session_proxy_pop(session_key)
+            log.warning("Consecutive empty streams x%s for '%s'; no alternate egress, unbound session.",
+                        strikes, model)
+    except Exception as exc:
+        log.warning("Empty-stream egress advance failed: %s", exc)
+    finally:
+        with _empty_stream_strikes_lock:
+            _empty_stream_strikes.pop(session_key, None)
+
+
+def _reset_empty_stream_strikes(session_key: str) -> None:
+    """上游成功返回一次即清零（打断连续计数）。"""
+    if not session_key:
+        return
+    with _empty_stream_strikes_lock:
+        _empty_stream_strikes.pop(session_key, None)
+
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_LEVEL_VALUE = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -3862,6 +3914,7 @@ async def chat_completions(raw_request: Request):
             if current_model in RESPONSES_ONLY_MODELS:
                 log.info(f"Upstream response for '{current_model}': status={response.status_code}")
             _mark_request_proxy_success(proxies)
+            _reset_empty_stream_strikes(session_key)
             _egress_rate_policy.record_success(egress_key)
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
@@ -3899,7 +3952,8 @@ async def chat_completions(raw_request: Request):
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
                     )
                 except EmptyStreamError:
-                    log.warning("Empty stream for '%s'; retrying without egress rotation (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
+                    log.warning("Empty stream for '%s'; retrying (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
+                    _note_empty_stream(session_key, current_model)
                     delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     await asyncio.sleep(delay)
                     continue
@@ -3973,6 +4027,7 @@ async def chat_completions(raw_request: Request):
                             _release_stream_session(stream_pool_key, session, discard=True)
                             stream_borrowed = False
                         log.warning("Empty forced stream for '%s'; retrying (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
+                        _note_empty_stream(session_key, current_model)
                         delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                         await asyncio.sleep(delay)
                         continue
@@ -4132,6 +4187,7 @@ async def anthropic_messages(raw_request: Request):
                 continue
 
             _mark_request_proxy_success(proxies)
+            _reset_empty_stream_strikes(session_key)
             _egress_rate_policy.record_success(egress_key)
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
@@ -4179,6 +4235,7 @@ async def anthropic_messages(raw_request: Request):
                             _release_stream_session(stream_pool_key, session, discard=True)
                             stream_borrowed = False
                         log.warning("Empty forced anthropic stream for '%s'; retrying (%s/%s).", model_name, attempt, MAX_RETRIES_ON_429)
+                        _note_empty_stream(session_key, model_name)
                         delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                         await asyncio.sleep(delay)
                         continue
@@ -4307,6 +4364,7 @@ async def responses_endpoint(raw_request: Request):
                 continue
 
             _mark_request_proxy_success(proxies)
+            _reset_empty_stream_strikes(session_key)
             _egress_rate_policy.record_success(egress_key)
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
@@ -4353,6 +4411,8 @@ async def responses_endpoint(raw_request: Request):
                         if stream_borrowed:
                             _release_stream_session(stream_pool_key, session, discard=True)
                             stream_borrowed = False
+                        log.warning("Empty forced responses stream for '%s'; retrying (%s/%s).", model_name, attempt, MAX_RETRIES_ON_429)
+                        _note_empty_stream(session_key, model_name)
                         delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                         await asyncio.sleep(delay)
                         continue
