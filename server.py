@@ -1140,6 +1140,30 @@ RESPONSES_ONLY_MODELS = {
     "muse-spark-1.2-contributor",
 }
 
+# 上游实测不可用的免费模型（2026-10-08/09 实测）：
+#  - exo-free：上游 410 ModelDeprecated，已下线；
+#  - fledge-alpha-free：能力目录 deprecated:true，调则 401 not supported，已下线；
+#  - jev-1.13-free：原生 System One 协议，走 chat 必 400，应走 /v1/systemone（本代理无此端点）；
+#  - deepseek/hy3/laguna：历史不可用。
+# space-bunny/longcat-2.5-preview/ling-3.1-flash 已验证可用（需 agent 形状流式请求，
+# 见 free-tier shim），不再屏蔽：发现列表过滤 + 推理入口快速 400，
+# 避免占住单并发（MAX_UPSTREAM_CONCURRENCY=1）反复重试拖死正常请求。
+UNAVAILABLE_MODELS = {
+    "deepseek-v4-flash-free", "hy3-free", "laguna-s-2.1-free", "jev-1.13-free",
+    "exo-free", "fledge-alpha-free",
+}
+
+def unavailable_model_response(model_name: str):
+    """已知不可用模型的快速拒绝响应（不占上游并发，直接 400）。"""
+    return JSONResponse(
+        status_code=400,
+        content={"error": {
+            "message": f"Model '{model_name}' is currently unavailable upstream. Use GET /v1/models for available free models.",
+            "type": "invalid_request_error",
+            "code": "model_unavailable",
+        }},
+    )
+
 def _convert_content_part(part: dict, text_type: str):
     """Chat Completions 内容段 → Responses API input 内容段。
 
@@ -2277,9 +2301,8 @@ def discover_models_task():
                             new_models.append({"id": m_id, "name": m_id.replace("-", " ").title()})
                     
                     if new_models:
-                        # 过滤掉已知不可用的模型
-                        unavailable = {"deepseek-v4-flash-free", "hy3-free", "laguna-s-2.1-free", "jev-1.13-free"}
-                        new_models = [m for m in new_models if m["id"] not in unavailable]
+                        # 过滤掉已知不可用的模型（见 UNAVAILABLE_MODELS）
+                        new_models = [m for m in new_models if m["id"] not in UNAVAILABLE_MODELS]
                         if new_models:
                             with _discovery_lock:
                                 discovered_models = new_models
@@ -3477,6 +3500,10 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
+    if current_model in UNAVAILABLE_MODELS:
+        log.warning(f"Rejecting known-unavailable model '{current_model}' without upstream attempts.")
+        return unavailable_model_response(current_model)
+
     if REQ_DIAG_ENABLED:
         try:
             _dj = json.dumps(payload, ensure_ascii=False, default=str)
@@ -3975,6 +4002,10 @@ async def anthropic_messages(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
 
+    if model_name in UNAVAILABLE_MODELS:
+        log.warning(f"Rejecting known-unavailable model '{model_name}' without upstream attempts.")
+        return unavailable_model_response(model_name)
+
     body = ensure_free_tier_tools_anthropic(body)
     force_upstream_stream = (
         (not is_stream) and FREE_TIER_SHIM_ENABLED
@@ -4156,6 +4187,10 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", DEFAULT_MODEL)
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+
+    if model_name in UNAVAILABLE_MODELS:
+        log.warning(f"Rejecting known-unavailable model '{model_name}' without upstream attempts.")
+        return unavailable_model_response(model_name)
 
     client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
     headers = get_realistic_headers(client_key)
