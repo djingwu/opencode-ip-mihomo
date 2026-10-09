@@ -1349,8 +1349,9 @@ def _convert_tool_choice_to_responses_format(tool_choice):
 
 
 # --- free-tier agentic shim -------------------------------------------------
-# 上游免费层要求请求"像真客户端"：
-#   stream=true 且含核心 agent 工具（bash, edit, glob, grep, read），否则 403 FreeTierError。
+# 上游免费层要求请求"像真客户端"（与 opencode2api prepareAnonymousBody 同逻辑）：
+#   stream=true 且含核心 agent 工具（bash, edit, glob, grep, read），否则 403 FreeTierError；
+#   新模型（space-bunny/longcat/ling-3.1）只接受最小 tools 定义，多余字段会导致空流/403。
 # 代理对免费模型自动补核心 tools；下游非流请求则强制走上游流式，
 # 播完聚合拼回下游要的 JSON（stream collapse），保证下游契约不变。
 FREE_TIER_SHIM_ENABLED = os.environ.get("FREE_TIER_SHIM_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -1459,28 +1460,31 @@ def _extract_local_title(messages) -> Optional[str]:
 
 
 def _shim_tool_responses(name: str) -> dict:
+    # 与 opencode2api anonymousTool 对齐的最小定义：只有名字起作用，
+    # 不带 required/strict 等额外字段（新模型对这些字段敏感，曾因此空流/403）。
     return {
         "type": "function", "name": name, "description": f"Agent tool {name}",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-        "strict": False,
+        "parameters": {"type": "object", "properties": {}},
     }
 
 
 def _shim_tool_chat(name: str) -> dict:
+    # 同上：最小 chat tools 定义，不带 required。
     return {
         "type": "function",
         "function": {
             "name": name, "description": f"Agent tool {name}",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {"type": "object", "properties": {}},
         },
     }
 
 
 def _shim_tool_anthropic(name: str) -> dict:
+    # 同上：最小 anthropic tools 定义，不带 required。
     return {
         "name": name,
         "description": f"Agent tool {name}",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "input_schema": {"type": "object", "properties": {}},
     }
 
 
