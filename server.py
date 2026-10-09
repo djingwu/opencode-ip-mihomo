@@ -983,7 +983,7 @@ def start_egress_watcher() -> None:
     _egress_watch_started = True
     threading.Thread(target=_egress_watch_loop, name="egress-watcher", daemon=True).start()
 
-def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0):
+def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0, count_request: bool = True):
     global model_usage_stats
     pricing = MODEL_PRICING.get(model_name, {"input_per_1m": 0.20, "output_per_1m": 0.80})
     prompt_cost = (prompt_tokens / 1_000_000) * pricing["input_per_1m"]
@@ -996,7 +996,10 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
                 "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                 "total_tokens": 0, "estimated_cost_usd": 0.0
             }
-        model_usage_stats[model_name]["requests"] += 1
+        # 流式请求在开始时已用估算记过一次 requests，结束时只补真实 token，
+        # 否则每个流式请求被数两次请求数（count_request=False）
+        if count_request:
+            model_usage_stats[model_name]["requests"] += 1
         model_usage_stats[model_name]["prompt_tokens"] += prompt_tokens
         model_usage_stats[model_name]["completion_tokens"] += completion_tokens
         model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
@@ -1005,10 +1008,22 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
     # 热路径只入队，后台线程批量刷盘；内存统计已实时更新，/metrics 不依赖本条落盘
     try:
         _pending_usage_rows.append(
-            (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost)
+            (model_name, 1 if count_request else 0, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost)
         )
     except Exception:
         pass
+
+def _pick_usage_num(usage, *keys, default=0):
+    """从上游 usage 字典取第一个为数字的键（兼容 prompt_tokens/input_tokens 两种命名）。"""
+    if not isinstance(usage, dict):
+        return default
+    for k in keys:
+        v = usage.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            return int(v)
+    return default
 
 # -----------------------------------------------------------------------------
 # WARP Quality Metrics
@@ -2003,13 +2018,14 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
         yield make_chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
 
-        # 更新 token usage
-        if usage:
-            track_token_usage(
-                model_name,
-                prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
-                completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
-            )
+        # 更新 token usage（responses 流独立生成器，不经过 stream_response finally，
+        # 这里是唯一补记点；无 usage 时沿用估算，保证不断记）
+        track_token_usage(
+            model_name,
+            prompt_tokens=_pick_usage_num(usage, "input_tokens", "prompt_tokens", default=DEFAULT_PROMPT_TOKENS),
+            completion_tokens=_pick_usage_num(usage, "output_tokens", "completion_tokens", default=DEFAULT_COMPLETION_TOKENS),
+            count_request=False,  # 流开始时已计数，这里只补真实 token
+        )
     finally:
         if session is not None:
             if stream_pool_key is not None:
@@ -2739,10 +2755,14 @@ async def stream_response(response, model_name: str, session=None, protocol: str
     anthropic_stop_reason = "end_turn"
     anthropic_stop_sequence = None
     anthropic_usage = {"input_tokens": 0, "output_tokens": 0}
+    # chat 协议流尾部 usage chunk（上游带 stream_options.include_usage 时必有）：
+    # inspect_line 透传时顺手捕获，finally 统一补记真实 token。
+    chat_usage: dict = {}
 
     def inspect_line(line: bytes) -> tuple[str, Optional[dict], str]:
         nonlocal has_meaningful_content, response_completed_seen, latest_response, pending_sse_event
         nonlocal anthropic_message_id, anthropic_stop_reason, anthropic_stop_sequence, anthropic_usage
+        nonlocal chat_usage
         raw = line.decode("utf-8", errors="ignore").strip()
         if is_responses_api and raw.startswith("event:"):
             pending_sse_event = raw[6:].strip()
@@ -2765,6 +2785,17 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             event_type = "__chat_content__" if any(
                 token in raw for token in ("content", "tool_calls", "reasoning_content")
             ) else ""
+            # chat 流尾部 usage chunk（含 stream_options.include_usage 时必有）：
+            # 透传同时捕获，finally 统一补记真实 token。
+            if '"usage"' in raw:
+                try:
+                    _data_text = raw[5:].strip() if raw.startswith("data:") else raw
+                    _chunk = json.loads(_data_text)
+                    _u = _chunk.get("usage") if isinstance(_chunk, dict) else None
+                    if isinstance(_u, dict) and _u:
+                        chat_usage.update(_u)
+                except (TypeError, ValueError):
+                    pass
         if event_type == "response.completed":
             response_completed_seen = True
         if isinstance(payload, dict) and isinstance(payload.get("response"), dict):
@@ -2973,6 +3004,26 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         elif not is_responses_api:
             yield b"\ndata: [DONE]\n\n"
     finally:
+        # 流结束补记真实 token：入口处只计了请求数（0/0），这里补真实 usage
+        #（count_request=False 不重数）；上游无 usage 事件时沿用估算，保证不断记。
+        try:
+            _real_usage = None
+            if is_responses_api:
+                _lr = latest_response if isinstance(latest_response, dict) else None
+                _lu = (_lr or {}).get("usage")
+                _real_usage = _lu if isinstance(_lu, dict) and _lu else None
+            elif is_anthropic_api:
+                _real_usage = anthropic_usage or None
+            else:
+                _real_usage = chat_usage or None
+            track_token_usage(
+                model_name,
+                prompt_tokens=_pick_usage_num(_real_usage, "prompt_tokens", "input_tokens", default=DEFAULT_PROMPT_TOKENS),
+                completion_tokens=_pick_usage_num(_real_usage, "completion_tokens", "output_tokens", default=DEFAULT_COMPLETION_TOKENS),
+                count_request=False,
+            )
+        except Exception:
+            pass
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
         await asyncio.to_thread(release_flow_lease, lease_id)
@@ -3770,9 +3821,9 @@ async def chat_completions(raw_request: Request):
                         inner_gen, model=current_model, proxies=proxies,
                         egress_key=egress_key, start_time=start_time, attempt=attempt,
                     )
-                    # 流式只记一条 history（包装器播完才写）；token 先按估算记一次，
-                    # 真实 usage 由 responses 转换函数在 completion 事件里再记（幂等聚合）
-                    track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                    # 流式只记一条 history（包装器播完才写）；真实 token 由各流函数
+                    # 结束时补记（count_request=False，不重数），这里只计请求数。
+                    track_token_usage(current_model, prompt_tokens=0, completion_tokens=0)
                     return StreamingResponse(
                         stream_gen,
                         media_type="text/event-stream",
@@ -3831,10 +3882,12 @@ async def chat_completions(raw_request: Request):
                         if current_model in RESPONSES_ONLY_MODELS:
                             res_json = _convert_responses_to_chat(res_json, current_model)
                         usage = res_json.get("usage", {})
+                        # chat 路径 usage 可能是 prompt_tokens（chat 上游）或
+                        # input_tokens（responses 上游经 _convert_responses_to_chat 透传）
                         track_token_usage(
                             current_model,
-                            prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
-                            completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
+                            prompt_tokens=_pick_usage_num(usage, "prompt_tokens", "input_tokens", default=DEFAULT_PROMPT_TOKENS),
+                            completion_tokens=_pick_usage_num(usage, "completion_tokens", "output_tokens", default=DEFAULT_COMPLETION_TOKENS)
                         )
                         record_request_history(
                             model=current_model,
@@ -4017,7 +4070,7 @@ async def anthropic_messages(raw_request: Request):
                     model=model_name, proxies=proxies,
                     egress_key=egress_key, start_time=start_time, attempt=attempt,
                 )
-                track_token_usage(model_name, prompt_tokens=100, completion_tokens=150)
+                track_token_usage(model_name, prompt_tokens=0, completion_tokens=0)
                 return StreamingResponse(
                     stream_gen,
                     media_type="text/event-stream",
@@ -4035,8 +4088,8 @@ async def anthropic_messages(raw_request: Request):
                         usage = res_json.get("usage", {})
                         track_token_usage(
                             model_name,
-                            prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
-                            completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+                            prompt_tokens=_pick_usage_num(usage, "input_tokens", "prompt_tokens", default=DEFAULT_PROMPT_TOKENS),
+                            completion_tokens=_pick_usage_num(usage, "output_tokens", "completion_tokens", default=DEFAULT_COMPLETION_TOKENS),
                         )
                         record_request_history(
                             model=model_name,
@@ -4188,7 +4241,7 @@ async def responses_endpoint(raw_request: Request):
                     model=model_name, proxies=proxies,
                     egress_key=egress_key, start_time=start_time, attempt=attempt,
                 )
-                track_token_usage(model_name, prompt_tokens=100, completion_tokens=150)
+                track_token_usage(model_name, prompt_tokens=0, completion_tokens=0)
                 return StreamingResponse(
                     stream_gen,
                     media_type="text/event-stream",
@@ -4203,7 +4256,12 @@ async def responses_endpoint(raw_request: Request):
                             stream_borrowed = False
                         else:
                             res_json = await asyncio.to_thread(response.json)
-                        track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
+                        usage = res_json.get("usage", {})
+                        track_token_usage(
+                            model_name,
+                            prompt_tokens=_pick_usage_num(usage, "input_tokens", "prompt_tokens", default=DEFAULT_PROMPT_TOKENS),
+                            completion_tokens=_pick_usage_num(usage, "output_tokens", "completion_tokens", default=DEFAULT_COMPLETION_TOKENS),
+                        )
                         record_request_history(
                             model=model_name,
                             proxy_ip=_request_proxy_url(proxies) or "",
