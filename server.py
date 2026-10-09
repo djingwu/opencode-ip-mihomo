@@ -902,16 +902,25 @@ def swap_warp_registration():
         return _dual_warp["active_registration"]
 
 # -----------------------------------------------------------------------------
-# Model pricing reference (USD per 1M tokens)
-# -----------------------------------------------------------------------------
+# Model pricing reference (USD per 1M tokens) — paid-tier official prices,
+# used to estimate savings vs. free-tier usage.
+# Sources (2026-09): Meta dev docs (muse contributor $0.10/$0.20),
+# Xiaomi mimo.mi.com overseas USD (mimo-v2.5/v2.6-flash $0.14/$0.28),
+# DeepInfra/NVIDIA (nemotron-3-ultra $0.50/$2.20, 3.5-lightning $0.05/$0.20),
+# Poolside list (laguna-s-2.1 $0.10/$0.20), DeepSeek docs V4.1 Flash
+# (deepseek-v4-flash $0.15/$0.60), Tencent Cloud docs (hy3 $0.132/$0.528),
+# OpenRouter (ling-3.0-flash $0.021/$0.063).
 MODEL_PRICING = {
     "deepseek-v4-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.60},
-    "mimo-v2.5-free": {"input_per_1m": 0.20, "output_per_1m": 0.80},
-    "nemotron-3-ultra-free": {"input_per_1m": 0.25, "output_per_1m": 0.90},
-    "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
-    "hy3-free": {"input_per_1m": 0.15, "output_per_1m": 0.50},
-    "muse-spark-1.2-contributor-free": {"input_per_1m": 0.10, "output_per_1m": 0.40},
-    "nemotron-3.5-lightning-free": {"input_per_1m": 0.18, "output_per_1m": 0.60},
+    "mimo-v2.5-free": {"input_per_1m": 0.14, "output_per_1m": 0.28},
+    "mimo-v2.6-flash-free": {"input_per_1m": 0.14, "output_per_1m": 0.28},
+    "nemotron-3-ultra-free": {"input_per_1m": 0.50, "output_per_1m": 2.20},
+    "nemotron-3.5-lightning-free": {"input_per_1m": 0.05, "output_per_1m": 0.20},
+    "laguna-s-2.1-free": {"input_per_1m": 0.10, "output_per_1m": 0.20},
+    "hy3-free": {"input_per_1m": 0.132, "output_per_1m": 0.528},
+    "ling-3.0-flash-fin-free": {"input_per_1m": 0.021, "output_per_1m": 0.063},
+    "muse-spark-1.2-contributor-free": {"input_per_1m": 0.10, "output_per_1m": 0.20},
+    "muse-spark-1.3-contributor-free": {"input_per_1m": 0.10, "output_per_1m": 0.20},
 }
 
 _model_usage_lock = threading.Lock()
@@ -1096,7 +1105,7 @@ metrics = {
 }
 
 DEFAULT_FREE_MODELS = [
-    {"id": "mimo-v2.5-free", "name": "MiMo V2.5 Free"},
+    {"id": "mimo-v2.6-flash-free", "name": "MiMo V2.6 Flash Free"},
     {"id": "ling-3.0-flash-fin-free", "name": "Ling 3.0 Flash Fin Free"},
     {"id": "nemotron-3-ultra-free", "name": "Nemotron 3 Ultra Free"},
     {"id": "nemotron-3.5-lightning-free", "name": "Nemotron 3.5 Lightning Free"},
@@ -1106,7 +1115,7 @@ DEFAULT_FREE_MODELS = [
 
 # 默认请求模型（可通过 DEFAULT_MODEL 覆盖）。上游 /models 返回的真实 free 模型会
 # 在自动发现后整体替换 DEFAULT_FREE_MODELS；此处仅作为发现失败时的兜底默认值。
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "mimo-v2.5-free")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "mimo-v2.6-flash-free")
 
 # 仅支持 Responses API 的模型（走 /v1/responses 而非 /v1/chat/completions）
 RESPONSES_ONLY_MODELS = {
