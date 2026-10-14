@@ -48,7 +48,9 @@ MODEL_DISCOVERY_INTERVAL = 300
 DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
-STREAM_TIMEOUT = 60
+# 流式上游总超时（秒）。原为硬编码 60，慢模型长生成会被中途截断；改为可配置，
+# 默认 120 与下面非流式分支的 timeout=120 对齐，消除两路超时不一致。
+STREAM_TIMEOUT = max(10, int(os.environ.get("STREAM_TIMEOUT", "120")))
 
 # Per-model timeout overrides (seconds) for known slow models
 MODEL_TIMEOUT_OVERRIDES = {
@@ -932,7 +934,7 @@ _metrics_snapshot_at = 0.0
 _metrics_snapshot_lock = threading.Lock()
 
 # 出口状态由后台线程定期刷新（默认 60s），/health 与 /metrics 只读缓存，不再同步打外部站
-_egress_cache = {"ok": True, "ip": None, "db_ok": True, "checked_at": 0.0}
+_egress_cache = {"ok": True, "ip": None, "db_ok": True, "checked_at": 0.0, "rotations": None}
 _egress_cache_lock = threading.Lock()
 EGRESS_STATUS_INTERVAL_SECONDS = max(15, int(os.environ.get("EGRESS_STATUS_INTERVAL_SECONDS", "60")))
 _egress_watch_stop = threading.Event()
@@ -958,8 +960,20 @@ def _refresh_egress_cache() -> None:
         db_ok = True
     except Exception:
         pass
+    # 轮换次数由 rotator 独立容器维护，proxy 进程内的 `rotation_count` 只是导入快照、
+    # 永不更新（2026-10-14 诊断 P2）。后台顺带从 rotator /status 刷新真实值供 /health。
+    rotations = None
+    try:
+        r = cffi_requests.get(f"{WARP_ROTATOR_URL}/status", impersonate="chrome124", timeout=4)
+        if r.status_code == 200:
+            rotations = r.json().get("rotations")
+    except Exception:
+        pass
     with _egress_cache_lock:
-        _egress_cache.update({"ok": ok, "ip": ip, "db_ok": db_ok, "checked_at": time.time()})
+        update = {"ok": ok, "ip": ip, "db_ok": db_ok, "checked_at": time.time()}
+        if rotations is not None:
+            update["rotations"] = int(rotations)
+        _egress_cache.update(update)
     try:
         prom_warp_health.set(1 if ok else 0)
     except Exception:
@@ -1094,6 +1108,11 @@ RATE_LIMIT_ROTATION_THRESHOLD = max(1, int(os.environ.get("RATE_LIMIT_ROTATION_T
 # 换出口也无用，直接快速失败并把 Retry-After 透给下游退避。
 LONG_BAN_THRESHOLD_SECONDS = max(30, int(os.environ.get("LONG_BAN_THRESHOLD_SECONDS", "120")))
 MAX_RATE_LIMIT_WAIT = max(0.0, float(os.environ.get("MAX_RATE_LIMIT_WAIT", "8")))
+# 429 重试退避下限（秒）：上游未返回 Retry-After 时也不能 0s 立即重试，
+# 否则突发场景会以秒级横扫整个出口池（2026-10-14 诊断 P1）。
+RATE_LIMIT_MIN_BACKOFF_SECONDS = max(0.0, float(os.environ.get("RATE_LIMIT_MIN_BACKOFF_SECONDS", "1.5")))
+# 确认 429 换出口后的退避（秒）：给上游与新出口一个缓冲，抑制 429 风暴。
+RATE_LIMIT_ROTATE_BACKOFF_SECONDS = max(0.0, float(os.environ.get("RATE_LIMIT_ROTATE_BACKOFF_SECONDS", "1.0")))
 NETWORK_FAILURE_ROTATION_THRESHOLD = max(1, int(os.environ.get("NETWORK_FAILURE_ROTATION_THRESHOLD", "2")))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
 # 429 时先触发 egress 换节点（mihomo/WARP），成功则重试，而不是直接透传给客户端
@@ -2359,7 +2378,8 @@ async def serialize_upstream_requests(request: Request, call_next):
                 yield chunk
                 # Detect client disconnect early to release semaphore
                 if await request.is_disconnected():
-                    log.warning("[STREAM DEBUG] Client disconnected mid-stream; releasing semaphore early.")
+                    if REQ_DIAG_ENABLED:
+                        log.warning("[STREAM DEBUG] Client disconnected mid-stream; releasing semaphore early.")
                     break
         finally:
             _upstream_request_semaphore.release()
@@ -2745,6 +2765,9 @@ async def recover_from_rate_limit(
     if not rotate_now:
         requested_delay = retry_after if retry_after is not None else 0.0
         delay = min(requested_delay, MAX_RATE_LIMIT_WAIT)
+        if retry_after is None:
+            # 上游未给 Retry-After：用退避下限，避免 0s 立即重试把上游打爆
+            delay = max(delay, RATE_LIMIT_MIN_BACKOFF_SECONDS)
         try:
             proxy_pool.record_upstream_quota(current_proxy or None, model_name, retry_after, "rate_limit")
         except Exception as exc:
@@ -2765,6 +2788,12 @@ async def recover_from_rate_limit(
     if not ROTATE_ON_429 or attempt >= MAX_RETRIES_ON_429:
         return False
 
+    # 给被 429 的旧出口记冷却，避免换出口后它立刻又被选中（否则会秒级横扫出口池）
+    try:
+        proxy_pool.record_upstream_quota(current_proxy or None, model_name, retry_after, "rate_limit")
+    except Exception as exc:
+        log.warning("Record quota failed: %s", exc)
+
     rotated, new_ip = await rotate_egress_safely(
         f"confirmed HTTP 429 x{streak} (attempt {attempt}/{MAX_RETRIES_ON_429})"
     )
@@ -2773,7 +2802,12 @@ async def recover_from_rate_limit(
         return False
 
     _reset_request_session(endpoint, session, pooled=pooled, stream_pool_key=stream_pool_key)
-    log.warning("Confirmed HTTP 429 for '%s'; egress rotated -> %s. Retrying.", model_name, new_ip)
+    if RATE_LIMIT_ROTATE_BACKOFF_SECONDS:
+        await asyncio.sleep(RATE_LIMIT_ROTATE_BACKOFF_SECONDS)
+    log.warning(
+        "Confirmed HTTP 429 for '%s'; egress rotated -> %s. Retrying in %.1fs.",
+        model_name, new_ip, RATE_LIMIT_ROTATE_BACKOFF_SECONDS,
+    )
     return True
 
 
@@ -3017,10 +3051,14 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             except StopIteration:
                 return "STOP_ITERATION"
             except Exception as exc:
-                log.error(
-                    "[STREAM DEBUG] Upstream socket/connection error for '%s': %s: %s",
-                    model_name, type(exc).__name__, exc,
-                )
+                if REQ_DIAG_ENABLED:
+                    log.error(
+                        "[STREAM DEBUG] Upstream socket/connection error for '%s': %s: %s",
+                        model_name, type(exc).__name__, exc,
+                    )
+                else:
+                    # 真实错误保留一行简报，详细堆栈仅在 REQ_DIAG=1 时输出
+                    log.warning("Upstream stream socket error for '%s': %s", model_name, type(exc).__name__)
                 return "SOCKET_ERROR"
 
         line_iter = response.iter_lines()
@@ -3130,10 +3168,11 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         raise
     except GeneratorExit:
         _discard_stream_session = True
-        log.warning(
-            "[STREAM DEBUG] Client explicitly closed/aborted SSE for '%s' after %s lines.",
-            model_name, chunk_count,
-        )
+        if REQ_DIAG_ENABLED:
+            log.warning(
+                "[STREAM DEBUG] Client explicitly closed/aborted SSE for '%s' after %s lines.",
+                model_name, chunk_count,
+            )
     except Exception as exc:
         _discard_stream_session = True
         log.error("Stream exception for '%s': %s: %s", model_name, type(exc).__name__, exc, exc_info=True)
@@ -3575,7 +3614,7 @@ async def health():
         "egress_ok": bool(state.get("ok", True)),
         "uptime_seconds": int(time.time() - metrics["start_time"]),
         "active_flows": active_flows_count,
-        "total_rotations": rotation_count,
+        "total_rotations": int(state.get("rotations") or 0),
         "warp_quality": dict(warp_quality_stats),
     }
 
