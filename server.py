@@ -2375,17 +2375,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _fetch_upstream_models():
+    """通过当前出口代理拉取上游模型列表。
+
+    2026-10-14：原实现用 urllib 直连 opencode.ai，每 5 分钟一次（288 次/天）全部
+    走 VPS 裸 IP，且没有 TLS 指纹伪装，基本会被上游静默拒绝（只落 debug 日志）。
+    改为走代理池出口 + chrome124 伪装；无可用出口时返回 None，保留上次列表。
+    """
+    disc_headers = get_realistic_headers()
+    proxy_url = proxy_pool.active_proxy() or proxy_pool.select_active_proxy()
+    if not proxy_url:
+        log.debug("Auto-Discovery skipped: no egress proxy available; keeping previous model list.")
+        return None
+    proxies = {"http": proxy_url, "https": proxy_url}
+    resp = cffi_requests.get(
+        f"{TARGET_ZEN_BASE}/models",
+        headers=disc_headers,
+        impersonate="chrome124",
+        proxies=proxies,
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        log.debug(f"Auto-Discovery upstream HTTP {resp.status_code} via {proxy_url}.")
+        return None
+    return resp.json()
+
+
 def discover_models_task():
     global discovered_models
     while not _discovery_stop.is_set():
         try:
-            disc_headers = get_realistic_headers()
-            req = UrlRequest(
-                f"{TARGET_ZEN_BASE}/models",
-                headers=disc_headers
-            )
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = _fetch_upstream_models()
+            if data:
                 models_data = data.get("data", [])
                 if models_data:
                     new_models = []
@@ -2393,7 +2414,7 @@ def discover_models_task():
                         m_id = m.get("id", "")
                         if "free" in m_id.lower() or "zen" in m_id.lower():
                             new_models.append({"id": m_id, "name": m_id.replace("-", " ").title()})
-                    
+
                     if new_models:
                         # 过滤掉已知不可用的模型（见 UNAVAILABLE_MODELS）
                         new_models = [m for m in new_models if m["id"] not in UNAVAILABLE_MODELS]
@@ -3121,6 +3142,22 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         elif not is_responses_api:
             yield b"\ndata: [DONE]\n\n"
     finally:
+        # 取消安全（2026-10-14 修复）：客户端断开时任务被取消，finally 中的 await 会
+        # 立即重抛 CancelledError，导致其后的计数递减 / 租约释放 / 连接归还全部被
+        # 跳过——实测每次断流 active_flows 泄漏 +1 且永不回落，死租约还会拖延
+        # rotator 的轮换判定（最多 90s TTL）。修法：同步清理先于任何 await 执行，
+        # 所有 await 包 BaseException 吞掉取消重抛，保证清理完整。
+        with flow_lock:
+            active_flows_count = max(0, active_flows_count - 1)
+            prom_active_flows.set(active_flows_count)
+        if session is not None:
+            if stream_pool_key is not None:
+                _release_stream_session(stream_pool_key, session, discard=_discard_stream_session or terminal_error)
+            else:
+                try:
+                    session.close()
+                except Exception:
+                    pass
         # 流结束补记真实 token：入口处只计了请求数（0/0），这里补真实 usage
         #（count_request=False 不重数）；上游无 usage 事件时沿用估算，保证不断记。
         try:
@@ -3142,19 +3179,14 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         except Exception:
             pass
         lease_heartbeat.cancel()
-        await asyncio.gather(lease_heartbeat, return_exceptions=True)
-        await asyncio.to_thread(release_flow_lease, lease_id)
-        with flow_lock:
-            active_flows_count = max(0, active_flows_count - 1)
-            prom_active_flows.set(active_flows_count)
-        if session is not None:
-            if stream_pool_key is not None:
-                _release_stream_session(stream_pool_key, session, discard=_discard_stream_session or terminal_error)
-            else:
-                try:
-                    session.close()
-                except Exception:
-                    pass
+        try:
+            await asyncio.gather(lease_heartbeat, return_exceptions=True)
+        except BaseException:
+            pass
+        try:
+            await asyncio.to_thread(release_flow_lease, lease_id)
+        except BaseException:
+            pass
 # 根路径直达控制面板（无需 /dashboard 后缀）
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
