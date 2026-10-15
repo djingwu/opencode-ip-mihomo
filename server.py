@@ -1086,10 +1086,15 @@ model_usage_stats: Dict[str, Dict[str, float]] = {}
 # -----------------------------------------------------------------------------
 PORT = int(os.environ.get("OPENCODE_ZEN_PORT", "8000"))
 HOST = os.environ.get("OPENCODE_ZEN_HOST", "127.0.0.1")
-TARGET_ZEN_BASE = os.environ.get("OPENCODE_ZEN_TARGET_BASE", "https://opencode.ai/zen/v1")
+# 2026-10-15：上游对匿名（Bearer public）通道加了客户端指纹闸门，旧的 /zen/v1 对
+# 匿名通道已被 console 代理剥掉凭证，恒 403 FreeTierError。匿名免费层现在只走
+# /inference/openai/v1（实测：同请求形状 /zen/v1 → 403，新端点 → 200 真流式）。
+TARGET_ZEN_BASE = os.environ.get("OPENCODE_ZEN_TARGET_BASE", "https://opencode.ai/inference/openai/v1")
 TARGET_ZEN_URL = f"{TARGET_ZEN_BASE}/chat/completions"
 TARGET_ZEN_ANTHROPIC_URL = f"{TARGET_ZEN_BASE}/messages"
 TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
+# 模型列表在旧端点仍公开可读（无需认证），作为发现失败时的兜底。
+TARGET_MODELS_BASES = [TARGET_ZEN_BASE, "https://opencode.ai/zen/v1"]
 
 MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "4"))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
@@ -1381,7 +1386,10 @@ def is_free_tier_model(name) -> bool:
     return bool(name) and "free" in str(name).lower()
 
 
-CORE_AGENT_TOOLS = ["bash", "edit", "glob", "grep", "read"]
+# 2026-10-15：上游会逐字节比对每个"它认识的工具"的 description 与 parameters schema，
+# 合成 stub 必 403。bash 是 pre-2.x 拼写——上游认识但网关没有它的官方定义，注入即 403，
+# 故改用 OpenCode 2.x 的 shell 拼写；官方定义见随包发布的 opencode_tools.json。
+CORE_AGENT_TOOLS = ["shell", "edit", "glob", "grep", "read"]
 
 # 假 tools 诱发调用后的续问 steering：下游没有真工具可执行，由代理侧合成
 # 工具结果续问，引导模型直接作答（流/非流共用）
@@ -1478,9 +1486,35 @@ def _extract_local_title(messages) -> Optional[str]:
         return None
 
 
+# --- 官方向量工具定义（2026-10-15）-----------------------------------------
+# 上游免费层自 2026-10-14 起会逐字节比对"它认识的每个工具"的 description 与
+# parameters schema：名字对但定义是合成 stub 一律 403 FreeTierError。因此随包
+# 发布从官方 CLI 抓取的 opencode_tools.json，注入与同名覆盖都用真定义。
+_OFFICIAL_TOOLS: Dict[str, dict] = {}
+try:
+    _tools_file = Path(__file__).parent / "opencode_tools.json"
+    if _tools_file.exists():
+        with open(_tools_file, encoding="utf-8") as _tf:
+            _OFFICIAL_TOOLS = json.load(_tf)
+except Exception as _e:  # pragma: no cover - 文件缺失时退化为最小 stub
+    log.warning("Failed to load opencode_tools.json: %s", _e)
+
+
+def _official_tool_def(name: str):
+    """返回官方定义 {description, parameters}，没有则 None。"""
+    d = _OFFICIAL_TOOLS.get(name)
+    if isinstance(d, dict) and d.get("description") and d.get("parameters"):
+        return d
+    return None
+
+
 def _shim_tool_responses(name: str) -> dict:
-    # 与 opencode2api anonymousTool 对齐的最小定义：只有名字起作用，
-    # 不带 required/strict 等额外字段（新模型对这些字段敏感，曾因此空流/403）。
+    d = _official_tool_def(name)
+    if d:
+        return {
+            "type": "function", "name": name,
+            "description": d["description"], "parameters": d["parameters"],
+        }
     return {
         "type": "function", "name": name, "description": f"Agent tool {name}",
         "parameters": {"type": "object", "properties": {}},
@@ -1488,7 +1522,15 @@ def _shim_tool_responses(name: str) -> dict:
 
 
 def _shim_tool_chat(name: str) -> dict:
-    # 同上：最小 chat tools 定义，不带 required。
+    d = _official_tool_def(name)
+    if d:
+        return {
+            "type": "function",
+            "function": {
+                "name": name, "description": d["description"],
+                "parameters": d["parameters"],
+            },
+        }
     return {
         "type": "function",
         "function": {
@@ -1499,7 +1541,11 @@ def _shim_tool_chat(name: str) -> dict:
 
 
 def _shim_tool_anthropic(name: str) -> dict:
-    # 同上：最小 anthropic tools 定义，不带 required。
+    d = _official_tool_def(name)
+    if d:
+        return {
+            "name": name, "description": d["description"], "input_schema": d["parameters"],
+        }
     return {
         "name": name,
         "description": f"Agent tool {name}",
@@ -1521,6 +1567,36 @@ def _resp_tool_names(tools) -> set:
     return names
 
 
+def _upgrade_official_tools(tools: list, protocol: str) -> bool:
+    """把客户端声明的"上游认识"的工具定义就地替换成官方向量定义。
+
+    上游逐字节比对 description + parameters schema，客户端自带的同名工具（schema
+    与官方不一致）会被判为 stub 而 403；换成真定义即可通过。名字上游不认识的工具
+    原样保留，以免破坏下游的函数调用。返回是否有改动。
+    """
+    changed = False
+    for idx, item in enumerate(tools):
+        if not isinstance(item, dict):
+            continue
+        if protocol == "chat":
+            fn = item.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+        else:
+            name = item.get("name")
+        if not name or not _official_tool_def(name):
+            continue
+        if protocol == "chat":
+            replacement = _shim_tool_chat(name)
+        elif protocol == "responses":
+            replacement = _shim_tool_responses(name)
+        else:
+            replacement = _shim_tool_anthropic(name)
+        if item != replacement:
+            tools[idx] = replacement
+            changed = True
+    return changed
+
+
 def ensure_free_tier_tools_responses(body: dict) -> dict:
     if not FREE_TIER_SHIM_ENABLED or not isinstance(body, dict):
         return body
@@ -1529,7 +1605,7 @@ def ensure_free_tier_tools_responses(body: dict) -> dict:
     tools = body.get("tools")
     tools = list(tools) if isinstance(tools, list) else []
     have = _resp_tool_names(tools)
-    changed = False
+    changed = _upgrade_official_tools(tools, "responses")
     for name in CORE_AGENT_TOOLS:
         if name not in have:
             tools.append(_shim_tool_responses(name))
@@ -1549,7 +1625,7 @@ def ensure_free_tier_tools_chat(payload: dict) -> dict:
     tools = payload.get("tools")
     tools = list(tools) if isinstance(tools, list) else []
     have = _resp_tool_names(tools)
-    changed = False
+    changed = _upgrade_official_tools(tools, "chat")
     for name in CORE_AGENT_TOOLS:
         if name not in have:
             tools.append(_shim_tool_chat(name))
@@ -1577,7 +1653,7 @@ def ensure_free_tier_tools_anthropic(body: dict) -> dict:
     for t in tools:
         if isinstance(t, dict) and t.get("name"):
             have.add(t.get("name"))
-    changed = False
+    changed = _upgrade_official_tools(tools, "anthropic")
     for name in CORE_AGENT_TOOLS:
         if name not in have:
             tools.append(_shim_tool_anthropic(name))
@@ -2408,17 +2484,27 @@ def _fetch_upstream_models():
         log.debug("Auto-Discovery skipped: no egress proxy available; keeping previous model list.")
         return None
     proxies = {"http": proxy_url, "https": proxy_url}
-    resp = cffi_requests.get(
-        f"{TARGET_ZEN_BASE}/models",
-        headers=disc_headers,
-        impersonate="chrome124",
-        proxies=proxies,
-        timeout=10,
-    )
-    if resp.status_code != 200:
-        log.debug(f"Auto-Discovery upstream HTTP {resp.status_code} via {proxy_url}.")
-        return None
-    return resp.json()
+    # 依次尝试新端点与旧的公开列表端点（2026-10-15：匿名推理走新端点，
+    # 但模型列表在旧端点仍公开可读，作为兜底）。
+    for base in TARGET_MODELS_BASES:
+        try:
+            resp = cffi_requests.get(
+                f"{base}/models",
+                headers=disc_headers,
+                impersonate="chrome124",
+                proxies=proxies,
+                timeout=10,
+            )
+        except Exception as exc:
+            log.debug(f"Auto-Discovery {base}/models failed via {proxy_url}: {exc}")
+            continue
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except Exception:
+                continue
+        log.debug(f"Auto-Discovery upstream HTTP {resp.status_code} via {proxy_url} ({base}).")
+    return None
 
 
 def discover_models_task():
@@ -2503,20 +2589,40 @@ def normalize_anthropic_request(body: dict) -> dict:
         normalized["system"] = [{"type": "text", "text": system}]
     return normalized
 
+_id_counter = 0
+
+
 def _random_opencode_id(prefix: str, descending: bool = True) -> str:
     """生成 OpenCode CLI 格式的 ID，如 msg_xxx / ses_xxx
     格式：前缀 + 12位hex时间戳 + 14位随机base62 = 30字符
-    与 opencode 源码 packages/schema/src/identifier.ts 一致"""
+    与 opencode 源码 packages/schema/src/identifier.ts 一致。
+
+    2026-10-15：counter 必须落在 1..63（官方实现同毫秒自增、跨毫秒归零）。
+    上游会解码 12 位时间前缀做校验，counter=0 会与官方形状对不上。"""
     import time
     import secrets
+    global _id_counter
     timestamp_ms = int(time.time() * 1000)
-    current = (timestamp_ms * 0x1000) + 0
+    _id_counter = (_id_counter % 63) + 1
+    current = (timestamp_ms * 0x1000) + _id_counter
     value = ~current if descending else current
     time_hex = format(value & 0xffffffffffff, '012x')
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     rand = ''.join(secrets.choice(chars) for _ in range(14))
     return f"{prefix}_{time_hex}{rand}"
 
+
+
+# 2026-10-15：上游按 OpenCode 客户端指纹放行。UA 必须是 opencode/<channel>/<version>/cli
+# 形状——v1 风格的 "opencode/1.18.31 ai-sdk/..." 会被直接 403。版本号本身不校验。
+OPENCODE_CLIENT_UA = os.environ.get("OPENCODE_CLIENT_UA", "opencode/latest/2.0.29/cli")
+
+
+def _client_project_id(project: str = "global") -> str:
+    """上游拒绝 canonical 的 prj_* 形状，只接受客户端自己的裸 40 位小写 hex。
+    值本身不校验、只校验形状；哈希保证同一会话稳定绑定同一 project。"""
+    import hashlib
+    return hashlib.sha256(b"opencode-project\x00" + project.encode()).hexdigest()[:40]
 
 
 def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
@@ -2537,13 +2643,16 @@ def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
         "Accept": "application/json, text/event-stream, */*",
-        "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+        "User-Agent": OPENCODE_CLIENT_UA,
         "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": _random_opencode_id("msg", descending=False),
+        # 上游 2026-10-14 起：canonical 的 prj_* 会 403，只认裸 40-hex 形状
+        "x-opencode-project": _client_project_id(),
+        # 注意：x-opencode-request 自 2026-10-14 起任何非空值都会 403，必须不发。
         # 同一 client_key 复用同一 session：原来每次随机，亲和失效 + map 堆垃圾。
         # 无 key 匿名请求保持每次随机（无法区分客户端，随机反而能分散代理）。
         "x-opencode-session": session,
+        # 上游要求两个 session 头同值；缺 x-opencode-session-id 会被 403
+        "x-opencode-session-id": session,
         "x-session-affinity": session,
         "X-Session-Id": session,
     }
@@ -2904,7 +3013,17 @@ async def stream_response(response, model_name: str, session=None, protocol: str
     with flow_lock:
         active_flows_count += 1
         prom_active_flows.set(active_flows_count)
-    lease_id = await asyncio.to_thread(acquire_flow_lease)
+    # 2026-10-15 修复：客户端可能在建租约这一步之前就断开，此处的 await 会立即
+    # 重抛取消（GeneratorExit/CancelledError），而后面的 try/finally 尚未进入 ——
+    # 计数就永远不回落。实测每次断流泄漏 +1（此前 403 快速失败时不会挂在 await
+    # 上，故被掩盖）。这里兜住取消：先递减再原样抛出，取消语义不变但计数闭环。
+    try:
+        lease_id = await asyncio.to_thread(acquire_flow_lease)
+    except BaseException:
+        with flow_lock:
+            active_flows_count = max(0, active_flows_count - 1)
+            prom_active_flows.set(active_flows_count)
+        raise
 
     async def keep_flow_lease_alive():
         try:

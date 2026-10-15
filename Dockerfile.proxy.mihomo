@@ -19,6 +19,8 @@ COPY proxy_pool.py .
 COPY rotator.py .
 COPY panel_manager.py .
 COPY free_nodes.py .
+# 官方向量工具定义（2026-10-15）：上游免费层逐字节比对工具定义，合成 stub 必 403
+COPY opencode_tools.json .
 COPY templates/ ./templates/
 
 EXPOSE 8000

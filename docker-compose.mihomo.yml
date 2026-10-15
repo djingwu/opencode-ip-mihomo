@@ -64,7 +64,8 @@ services:
     environment:
       - OPENCODE_ZEN_PORT=8000
       - OPENCODE_ZEN_HOST=0.0.0.0
-      - OPENCODE_ZEN_TARGET_BASE=https://opencode.ai/zen/v1
+      # 2026-10-15：匿名（Bearer public）通道必须走新端点，/zen/v1 恒 403 FreeTierError
+      - OPENCODE_ZEN_TARGET_BASE=${OPENCODE_ZEN_TARGET_BASE:-https://opencode.ai/inference/openai/v1}
       # 出站统一走自定义代理池（用户要求禁用 mihomo）
       # 429/空流等场景由 rotator 负责换节点
       - WARP_ROTATOR_URL=http://rotator:8001
