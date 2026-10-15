@@ -472,8 +472,9 @@ def _flush_metrics_buffers() -> None:
         try:
             _db_executemany(
                 """INSERT INTO request_history
-                   (timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream, attempt, error_msg)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream,
+                    attempt, error_msg, client)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 history_batch,
             )
         except Exception:
@@ -483,11 +484,12 @@ def _flush_metrics_buffers() -> None:
         try:
             _db_executemany(
                 """INSERT INTO request_trace
-                   (ts, ts_ms, model, endpoint, is_stream, client_tools, proxy_ip, egress_ip,
+                   (ts, ts_ms, model, endpoint, client, is_stream, client_tools,
+                    proxy_ip, egress_ip,
                     ttft_ms, total_ms, chunks, out_bytes, status, attempt, finish_reason,
                     downstream_tool_calls, upstream_status, error_type,
                     prompt_tokens, completion_tokens)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 trace_batch,
             )
         except Exception:
@@ -568,6 +570,7 @@ def init_db():
             is_stream INTEGER DEFAULT 0,
             attempt INTEGER DEFAULT 1,
             error_msg TEXT,
+            client TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -581,6 +584,7 @@ def init_db():
             ts_ms INTEGER,
             model TEXT,
             endpoint TEXT,
+            client TEXT,
             is_stream INTEGER DEFAULT 0,
             client_tools INTEGER DEFAULT 0,
             proxy_ip TEXT,
@@ -607,6 +611,19 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_request_trace_model "
         "ON request_trace(model)"
     )
+    # 2026-10-15：客户端标识。SQLite 不能给已有表加列，需按需 ALTER 补齐。
+    for _tbl, _coldef in (
+        ("request_history", "client TEXT"),
+        ("request_trace", "client TEXT"),
+    ):
+        try:
+            _cols = {r[1] for r in _db_fetchall("PRAGMA table_info(%s)" % _tbl)}
+            if _cols and _coldef.split()[0] not in _cols:
+                _db_execute("ALTER TABLE %s ADD COLUMN %s" % (_tbl, _coldef))
+                log.info("Migrated %s: added column '%s'.", _tbl, _coldef.split()[0])
+        except Exception as _e:
+            log.warning("Column migration failed for %s.%s: %s",
+                        _tbl, _coldef.split()[0], _e)
     _db_execute(
         "CREATE INDEX IF NOT EXISTS idx_request_history_created "
         "ON request_history(created_at)"
@@ -685,6 +702,7 @@ def record_request_history(
     is_stream: bool = False,
     attempt: int = 1,
     error_msg: str = "",
+    client: str = "",
 ):
     """Buffer one request row; flushed in batches by _metrics_flush_loop."""
     try:
@@ -699,6 +717,7 @@ def record_request_history(
                 1 if is_stream else 0,
                 attempt,
                 error_msg[:200] if error_msg else "",
+                client[:32] if client else "",
             )
         )
     except Exception:
@@ -735,6 +754,7 @@ def record_request_trace(
     *,
     model: str = "",
     endpoint: str = "",
+    client: str = "",
     is_stream: bool = False,
     client_tools: bool = False,
     proxy_ip: str = "",
@@ -762,6 +782,7 @@ def record_request_trace(
             int(now * 1000),
             model or "",
             endpoint or "",
+            client[:32] if client else "",
             1 if is_stream else 0,
             1 if client_tools else 0,
             proxy_ip or "",
@@ -785,7 +806,7 @@ def record_request_trace(
 
 async def _stream_with_history(inner_gen, *, model: str, proxies, egress_key: str, start_time: float,
                                attempt: int, endpoint: str = "chat", client_tools: bool = False,
-                               upstream_status=None):
+                               upstream_status=None, client: str = ""):
     """Wrap SSE generator so streaming requests also leave a request_history row.
 
     StreamingResponse consumes the generator after the endpoint returns, so the
@@ -845,6 +866,7 @@ async def _stream_with_history(inner_gen, *, model: str, proxies, egress_key: st
                 is_stream=True,
                 attempt=attempt,
                 error_msg=error_msg,
+                client=client,
             )
         except Exception:
             pass
@@ -852,6 +874,7 @@ async def _stream_with_history(inner_gen, *, model: str, proxies, egress_key: st
             record_request_trace(
                 model=model,
                 endpoint=endpoint,
+                client=client,
                 is_stream=True,
                 client_tools=client_tools,
                 proxy_ip=_request_proxy_url(proxies) or "",
@@ -1830,30 +1853,6 @@ def _resp_tool_names(tools) -> set:
     return names
 
 
-# 2026-10-15：spark 等 reasoning 模型默认思考量极大，小 budget 全烧在 reasoning 上
-# 导致空回（finish=length、正文为空）。免费层默认 minimal（实测 53 token/2s 出正文，
-# 默认要烧 357+ token 且经常超 budget）；下游显式指定则尊重；设为 none 即关闭。
-RESPONSES_REASONING_EFFORT = os.environ.get("RESPONSES_REASONING_EFFORT", "minimal").strip().lower()
-
-
-def _ensure_reasoning_effort(body: dict) -> dict:
-    """免费层 responses 请求默认 reasoning effort（下游显式指定则不动）。"""
-    if not isinstance(body, dict):
-        return body
-    if not RESPONSES_REASONING_EFFORT or RESPONSES_REASONING_EFFORT == "none":
-        return body
-    cur = body.get("reasoning")
-    if isinstance(cur, dict):
-        if cur.get("effort"):
-            return body  # 下游显式指定，尊重
-        cur = dict(cur)
-        cur["effort"] = RESPONSES_REASONING_EFFORT
-        body["reasoning"] = cur
-        return body
-    body["reasoning"] = {"effort": RESPONSES_REASONING_EFFORT}
-    return body
-
-
 def _upgrade_official_tools(tools: list, protocol: str) -> bool:
     """把客户端声明的"上游认识"的工具定义就地替换成官方向量定义。
 
@@ -1916,7 +1915,6 @@ def ensure_free_tier_tools_responses(body: dict) -> dict:
                     ]
             except Exception:
                 pass
-    _ensure_reasoning_effort(body)
     return body
 
 
@@ -2487,17 +2485,6 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                      model_name, _depth, _text_len, _text_head, len(done_calls),
                      [c.get("name") for c in done_calls], finish_reason, saw_completed)
         yield make_chunk({}, finish_reason)
-        # OpenAI 流式约定：尾部附 usage 块，下游计费/统计靠它；
-        # responses 转 chat 流之前从不发 usage，下游看到的一直是 0/0。
-        _u_in = _pick_usage_num(usage, "input_tokens", "prompt_tokens", default=0)
-        _u_out = _pick_usage_num(usage, "output_tokens", "completion_tokens", default=0)
-        if _u_in > 0 or _u_out > 0:
-            yield (b"data: " + json.dumps({
-                "id": message_id, "object": "chat.completion.chunk", "created": created,
-                "model": model_name, "choices": [],
-                "usage": {"prompt_tokens": _u_in, "completion_tokens": _u_out,
-                          "total_tokens": _u_in + _u_out},
-            }, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n")
         yield b"data: [DONE]\n\n"
 
         # 更新 token usage（responses 流独立生成器，不经过 stream_response finally，
@@ -2946,6 +2933,143 @@ def _client_project_id(project: str = "global") -> str:
     return hashlib.sha256(b"opencode-project\x00" + project.encode()).hexdigest()[:40]
 
 
+# ── 下游客户端识别（2026-10-15）────────────────────────────────────────────
+# 目的：让请求历史 / trace 能区分「谁在调」——opencode CLI、codex、curl、面板等。
+#
+# 关键约束：绝不能用 get_realistic_headers() 里那套头来判断客户端。那是网关
+# 发给【上游】的伪装指纹（User-Agent=opencode/.../cli、x-opencode-client=cli），
+# 无论真实客户端是谁都会是这些值，用它判断会把所有请求都认成 opencode。
+# 正确来源是 raw_request.headers，即下游真正发来的头。
+#
+# 另注：三个端点都会把下游的 x-opencode-* 头原样透传给上游（L4313 等），
+# 下游若带 x-opencode-request 会直接触发上游 403 闸门，所以识别逻辑只「读」
+# 这些头，绝不「写」，保持现有透传行为不变。
+CLIENT_PROBE_ENABLED = os.environ.get(
+    "CLIENT_PROBE", "0").lower() in ("true", "1", "yes")
+
+# 指纹头白名单：只取这些用于识别，避免把 Authorization / Cookie 之类
+# 敏感或高基数字段带进来。
+_CLIENT_FINGERPRINT_HEADERS = (
+    "user-agent",
+    "x-opencode-client",
+    "x-opencode-version",
+    "x-opencode-session",
+    "x-stainless-lang",
+    "x-stainless-package-version",
+    "x-stainless-os",
+    "x-stainless-arch",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-retry-count",
+    "x-client-type",
+    "x-source",
+    "x-app",
+    "x-request-source",
+    "originator",
+)
+
+
+def _redact_client_header_value(key, value):
+    """会话类 id 只留形状，不落原文（避免把可关联标识写进日志库）。"""
+    low = key.lower()
+    if "session" in low:
+        v = value.strip()
+        if len(v) > 8:
+            return v[:4] + "..." + v[-4:]
+        return v
+    return value
+
+
+def _fingerprint_downstream_client(raw_request, body=None):
+    """收集下游客户端指纹快照（仅 CLIENT_PROBE=1 时调用）。
+
+    返回一行紧凑 JSON，值已截断/脱敏。用于识别规则上线前的规则校准，
+    以及将来遇到未知客户端时的兜底取证。
+    """
+    try:
+        snap = {}
+        for key in _CLIENT_FINGERPRINT_HEADERS:
+            val = raw_request.headers.get(key)
+            if not val:
+                continue
+            snap[key] = _redact_client_header_value(key, val)[:120]
+        # body 侧信号：部分 SDK 在 metadata 里放 user_agent
+        if isinstance(body, dict):
+            _meta = body.get("metadata")
+            if isinstance(_meta, dict):
+                for _mk in ("user_agent", "client", "source"):
+                    if _meta.get(_mk):
+                        snap["body.metadata." + _mk] = str(_meta[_mk])[:80]
+        if not snap:
+            return ""
+        return json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return ""
+
+
+def detect_client(raw_request, body=None):
+    """识别真实下游客户端，返回短标签。
+
+    只读 raw_request.headers（下游真发来的头），不碰伪装给上游的那套头。
+    判定优先级：显式声明 > SDK 指纹 > UA 关键字 > 无 UA 兜底。
+    """
+    try:
+        h = raw_request.headers
+        ua = (h.get("user-agent") or "").strip()
+        ua_low = ua.lower()
+
+        # 1) 客户端主动声明（最可信）
+        declared = (h.get("x-opencode-client") or "").strip().lower()
+        if declared:
+            return declared[:32]
+        declared2 = (h.get("x-client-type") or h.get("x-app")
+                     or h.get("x-request-source") or h.get("originator") or "").strip().lower()
+        if declared2:
+            return declared2[:32]
+
+        # 2) Stainless 系 SDK 指纹（codex / openai-python 等都用）
+        if h.get("x-stainless-lang"):
+            if "codex" in ua_low:
+                return "codex"
+            return "openai-sdk"
+
+        # 3) UA 关键字
+        for _kw, _label in (
+            # 实测 2026-10-15：本机主力客户端是 WorkBuddy，UA 形如
+            # "WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0"
+            ("workbuddy", "workbuddy"),
+            ("codebuddy", "codebuddy"),
+            ("codex", "codex"),
+            ("openai-", "codex"),
+            ("opencode", "opencode"),
+            ("claude-cli", "claude-code"),
+            ("claude-code", "claude-code"),
+            ("anthropic", "claude-code"),
+            ("cline", "cline"),
+            ("roo-code", "roo-code"),
+            ("kilocode", "kilocode"),
+            ("continue", "continue"),
+            ("aider", "aider"),
+            ("curl", "curl"),
+            ("python-requests", "python-requests"),
+            ("httpx", "python-httpx"),
+            ("openai-node", "openai-node"),
+            ("undici", "node-undici"),
+            ("node-fetch", "node"),
+        ):
+            if _kw in ua_low:
+                return _label
+        if ua_low.startswith("mozilla") or ua_low.startswith("chrome"):
+            return "browser"
+
+        # 4) 无 UA 线索
+        if not ua_low:
+            return "no-ua"
+        return "other"
+    except Exception:
+        return "unknown"
+
+
 def get_realistic_headers(client_key: str = "") -> Dict[str, str]:
     if client_key:
         with _session_cache_lock:
@@ -3131,25 +3255,9 @@ async def recover_from_rate_limit(
     stream_pool_key=None,
     session_key: str = "",
     current_proxy: str = "",
-    start_time: float = 0,
 ) -> bool:
     """Retry a transient 429 once on the same IP before considering rotation."""
     category, retry_after, _ = classify_upstream_429(response)
-    # 中间态 429 可见性：每次上游 429 都记一行 retrying（最终成功/失败另有终态行），
-    # 否则请求历史里完全看不到限流过程。记录失败不影响主流程。
-    try:
-        record_request_history(
-            model=model_name,
-            proxy_ip=current_proxy or "",
-            egress_ip=egress_key,
-            latency_ms=round((time.time() - start_time) * 1000, 1) if start_time else 0,
-            status="retrying",
-            is_stream=not pooled,
-            attempt=attempt,
-            error_msg=f"upstream_429[{category}] retry_after={retry_after}s",
-        )
-    except Exception:
-        pass
     if category == "quota":
         # 日配额类 429：记下该出口该模型的冷却，供选路和面板使用
         try:
@@ -4002,14 +4110,23 @@ async def panel_remove_proxy(addr: str):
     return result
 
 @app.get("/api/panel/history")
-def api_request_history(limit: int = 100):
-    """Return recent request history records."""
+def api_request_history(limit: int = 100, client: str = ""):
+    """Return recent request history records.
+
+    2026-10-15：新增 client 列（opencode / codex / curl / browser / no-ua ...），
+    用来区分「谁在调」；client 非空时只返回该客户端的记录。
+    """
     try:
-        rows = _db_fetchall(
-            "SELECT id, timestamp, model, proxy_ip, egress_ip, latency_ms, status, is_stream, attempt, error_msg "
-            "FROM request_history ORDER BY id DESC LIMIT ?",
-            (min(limit, 500),),
-        )
+        sql = ("SELECT id, timestamp, model, proxy_ip, egress_ip, latency_ms, "
+               "status, is_stream, attempt, error_msg, client "
+               "FROM request_history")
+        params = []
+        if client:
+            sql += " WHERE client = ?"
+            params.append(client)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(min(limit, 500))
+        rows = _db_fetchall(sql, tuple(params))
         result = []
         for row in rows:
             if hasattr(row, 'keys'):
@@ -4018,16 +4135,49 @@ def api_request_history(limit: int = 100):
                 result.append({
                     "id": row[0], "timestamp": row[1], "model": row[2],
                     "proxy_ip": row[3], "egress_ip": row[4], "latency_ms": row[5],
-                    "status": row[6], "is_stream": row[7], "attempt": row[8], "error_msg": row[9],
+                    "status": row[6], "is_stream": row[7], "attempt": row[8],
+                    "error_msg": row[9], "client": row[10] if len(row) > 10 else "",
                 })
         return {"ok": True, "history": result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/panel/clients")
+def api_client_breakdown(since: str = "", limit: int = 20000):
+    """按客户端聚合请求数/成功率/平均耗时，用于快速看谁在调、调得好不好。"""
+    try:
+        sql = ("SELECT COALESCE(NULLIF(client, ''), 'unknown'), "
+               "COUNT(*), "
+               "SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END), "
+               "AVG(latency_ms), "
+               "SUM(CASE WHEN status!='ok' THEN 1 ELSE 0 END) "
+               "FROM request_history")
+        params = []
+        if since:
+            sql += " WHERE timestamp >= ?"
+            params.append(since)
+        sql += " GROUP BY 1 ORDER BY 2 DESC LIMIT ?"
+        params.append(min(limit, 500))
+        rows = _db_fetchall(sql, tuple(params))
+        out = []
+        for row in rows:
+            # 显式按位置取，不依赖 sqlite 对列别名的处理
+            out.append({
+                "client": row[0],
+                "requests": row[1],
+                "ok": row[2],
+                "avg_ms": round(row[3], 1) if row[3] is not None else None,
+                "failed": row[4],
+            })
+        return {"ok": True, "clients": out}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/panel/trace")
 def api_request_trace(limit: int = 200, since: str = "", model: str = "",
-                      only_slow: int = 0, only_problem: int = 0):
+                      only_slow: int = 0, only_problem: int = 0, client: str = ""):
     """单请求级 trace（2026-10-15 埋点）：TTFT / 输出量 / finish_reason / 错误类型。
 
     query:
@@ -4036,6 +4186,7 @@ def api_request_trace(limit: int = 200, since: str = "", model: str = "",
       model          精确匹配模型名
       only_slow      1 = 只返回 total_ms > 30000 或 attempt > 1 的
       only_problem   1 = 只返回 status != ok / error_type 非空 / downstream_tool_calls=1
+      client         精确匹配客户端标签（opencode / codex / curl / ...）
     """
     try:
         where, params = [], []
@@ -4050,10 +4201,13 @@ def api_request_trace(limit: int = 200, since: str = "", model: str = "",
         if only_problem:
             where.append("(status != 'ok' OR (error_type IS NOT NULL AND error_type != '') "
                          "OR downstream_tool_calls = 1)")
+        if client:
+            where.append("client = ?")
+            params.append(client)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         params.append(min(limit, 500))
         rows = _db_fetchall(
-            "SELECT id, ts, model, endpoint, is_stream, client_tools, proxy_ip, egress_ip, "
+            "SELECT id, ts, model, endpoint, client, is_stream, client_tools, proxy_ip, egress_ip, "
             "ttft_ms, total_ms, chunks, out_bytes, status, attempt, finish_reason, "
             "downstream_tool_calls, upstream_status, error_type, prompt_tokens, completion_tokens "
             "FROM request_trace" + clause + " ORDER BY id DESC LIMIT ?",
@@ -4066,13 +4220,14 @@ def api_request_trace(limit: int = 200, since: str = "", model: str = "",
             else:
                 out.append({
                     "id": row[0], "ts": row[1], "model": row[2], "endpoint": row[3],
-                    "is_stream": row[4], "client_tools": row[5], "proxy_ip": row[6],
-                    "egress_ip": row[7], "ttft_ms": row[8], "total_ms": row[9],
-                    "chunks": row[10], "out_bytes": row[11], "status": row[12],
-                    "attempt": row[13], "finish_reason": row[14],
-                    "downstream_tool_calls": row[15], "upstream_status": row[16],
-                    "error_type": row[17], "prompt_tokens": row[18],
-                    "completion_tokens": row[19],
+                    "client": row[4],
+                    "is_stream": row[5], "client_tools": row[6], "proxy_ip": row[7],
+                    "egress_ip": row[8], "ttft_ms": row[9], "total_ms": row[10],
+                    "chunks": row[11], "out_bytes": row[12], "status": row[13],
+                    "attempt": row[14], "finish_reason": row[15],
+                    "downstream_tool_calls": row[16], "upstream_status": row[17],
+                    "error_type": row[18], "prompt_tokens": row[19],
+                    "completion_tokens": row[20],
                 })
         return {"ok": True, "count": len(out), "trace": out}
     except Exception as e:
@@ -4260,6 +4415,10 @@ async def chat_completions(raw_request: Request):
     current_model = payload.get("model", DEFAULT_MODEL)
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
+    _client_tag = detect_client(raw_request, payload)
+    if CLIENT_PROBE_ENABLED:
+        log.info("client-probe endpoint=chat client=%s fp=%s", _client_tag,
+                 _fingerprint_downstream_client(raw_request, payload))
 
     if current_model in UNAVAILABLE_MODELS:
         log.warning(f"Rejecting known-unavailable model '{current_model}' without upstream attempts.")
@@ -4427,7 +4586,7 @@ async def chat_completions(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, current_model)
-                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or "", start_time=start_time):
+                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -4504,7 +4663,8 @@ async def chat_completions(raw_request: Request):
                             is_stream=bool(is_stream),
                             attempt=attempt,
                             error_msg="title_fallback",
-                        )
+                            client=_client_tag,
+                            )
                     except Exception:
                         pass
                     track_token_usage(current_model, prompt_tokens=20, completion_tokens=5)
@@ -4555,7 +4715,8 @@ async def chat_completions(raw_request: Request):
                         is_stream=True,
                         attempt=attempt,
                         error_msg=f"upstream_{response.status_code}",
-                    )
+                        client=_client_tag,
+                        )
                     return StreamingResponse(
                         [error_sse, "data: [DONE]\n\n"],
                         media_type="text/event-stream",
@@ -4620,6 +4781,7 @@ async def chat_completions(raw_request: Request):
                         egress_key=egress_key, start_time=start_time, attempt=attempt,
                         endpoint=_trace_endpoint, client_tools=_has_real_tools,
                         upstream_status=getattr(response, "status_code", None),
+                        client=_client_tag,
                     )
                     # 流式只记一条 history（包装器播完才写）；真实 token 由各流函数
                     # 结束时补记（count_request=False，不重数），这里只计请求数。
@@ -4698,7 +4860,8 @@ async def chat_completions(raw_request: Request):
                             status="ok",
                             is_stream=False,
                             attempt=attempt,
-                        )
+                            client=_client_tag,
+                            )
                         try:
                             record_request_trace(
                                 model=current_model,
@@ -4718,7 +4881,8 @@ async def chat_completions(raw_request: Request):
                                 upstream_status=getattr(response, "status_code", None),
                                 prompt_tokens=_pick_usage_num(usage, "prompt_tokens", "input_tokens", default=0),
                                 completion_tokens=_pick_usage_num(usage, "completion_tokens", "output_tokens", default=0),
-                            )
+                                client=_client_tag,
+                                )
                         except Exception:
                             pass
                         return JSONResponse(content=res_json)
@@ -4772,7 +4936,8 @@ async def chat_completions(raw_request: Request):
         is_stream=is_stream,
         attempt=MAX_RETRIES_ON_429,
         error_msg="All attempts exhausted",
-    )
+        client=_client_tag,
+        )
     try:
         record_request_trace(
             model=current_model,
@@ -4791,7 +4956,8 @@ async def chat_completions(raw_request: Request):
             downstream_tool_calls=False,
             upstream_status=getattr(response, "status_code", None),
             error_type="exhausted",
-        )
+            client=_client_tag,
+            )
     except Exception:
         pass
     return JSONResponse(
@@ -4819,6 +4985,10 @@ async def anthropic_messages(raw_request: Request):
     model_name = body.get("model", DEFAULT_MODEL)
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
+    _client_tag = detect_client(raw_request, body)
+    if CLIENT_PROBE_ENABLED:
+        log.info("client-probe endpoint=anthropic client=%s fp=%s", _client_tag,
+                 _fingerprint_downstream_client(raw_request, body))
 
     if model_name in UNAVAILABLE_MODELS:
         log.warning(f"Rejecting known-unavailable model '{model_name}' without upstream attempts.")
@@ -4891,7 +5061,7 @@ async def anthropic_messages(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or "", start_time=start_time):
+                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -4921,6 +5091,7 @@ async def anthropic_messages(raw_request: Request):
                     egress_key=egress_key, start_time=start_time, attempt=attempt,
                     endpoint="anthropic", client_tools=bool(body.get("tools")),
                     upstream_status=getattr(response, "status_code", None),
+                    client=_client_tag,
                 )
                 track_token_usage(model_name, prompt_tokens=0, completion_tokens=0)
                 return StreamingResponse(
@@ -4951,7 +5122,8 @@ async def anthropic_messages(raw_request: Request):
                             status="ok",
                             is_stream=False,
                             attempt=attempt,
-                        )
+                            client=_client_tag,
+                            )
                         try:
                             _an_tc = any(
                                 isinstance(c, dict) and c.get("type") == "tool_use"
@@ -4975,7 +5147,8 @@ async def anthropic_messages(raw_request: Request):
                                 upstream_status=getattr(response, "status_code", None),
                                 prompt_tokens=_pick_usage_num(usage, "input_tokens", "prompt_tokens", default=0),
                                 completion_tokens=_pick_usage_num(usage, "output_tokens", "completion_tokens", default=0),
-                            )
+                                client=_client_tag,
+                                )
                         except Exception:
                             pass
                         return JSONResponse(content=res_json)
@@ -5035,6 +5208,10 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", DEFAULT_MODEL)
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+    _client_tag = detect_client(raw_request, body)
+    if CLIENT_PROBE_ENABLED:
+        log.info("client-probe endpoint=responses client=%s fp=%s", _client_tag,
+                 _fingerprint_downstream_client(raw_request, body))
 
     if model_name in UNAVAILABLE_MODELS:
         log.warning(f"Rejecting known-unavailable model '{model_name}' without upstream attempts.")
@@ -5096,7 +5273,7 @@ async def responses_endpoint(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or "", start_time=start_time):
+                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -5126,6 +5303,7 @@ async def responses_endpoint(raw_request: Request):
                     egress_key=egress_key, start_time=start_time, attempt=attempt,
                     endpoint="responses", client_tools=bool(body.get("tools")),
                     upstream_status=getattr(response, "status_code", None),
+                    client=_client_tag,
                 )
                 track_token_usage(model_name, prompt_tokens=0, completion_tokens=0)
                 return StreamingResponse(
@@ -5156,7 +5334,8 @@ async def responses_endpoint(raw_request: Request):
                             status="ok",
                             is_stream=False,
                             attempt=attempt,
-                        )
+                            client=_client_tag,
+                            )
                         try:
                             _rp_fc = ""
                             try:
@@ -5184,6 +5363,7 @@ async def responses_endpoint(raw_request: Request):
                                 upstream_status=getattr(response, "status_code", None),
                                 prompt_tokens=_pick_usage_num(usage, "input_tokens", "prompt_tokens", default=0),
                                 completion_tokens=_pick_usage_num(usage, "output_tokens", "completion_tokens", default=0),
+                                client=_client_tag,
                             )
                         except Exception:
                             pass
