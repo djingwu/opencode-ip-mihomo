@@ -1382,8 +1382,53 @@ FREE_TIER_SHIM_ENABLED = os.environ.get("FREE_TIER_SHIM_ENABLED", "true").lower(
 # 临时诊断（req-diag / stream-summary 日志）：排查"发图后只回前半句"类问题用
 REQ_DIAG_ENABLED = os.environ.get("REQ_DIAG", "0").lower() in ("true", "1", "yes")
 
+# 2026-10-15：为过上游 403 指纹闸门，网关必须注入"官方向量"工具定义（真 description +
+# 真 schema）。副作用是上游模型真的会用这些工具——对不带工具的普通聊天客户端，表现为
+# 「回答一两句后发起 tool_call、finish_reason=tool_calls 就结束」，正文为空，客户端接
+# 不住工具调用就一直卡住。实测 tool_choice="none" 被上游忽略，只能用 system 指令压制。
+# 仅在「客户端本来就没带 tools」时注入，避免破坏 opencode CLI 这类真需要工具的客户端。
+FREE_TIER_NO_TOOL_NUDGE_ENABLED = os.environ.get(
+    "FREE_TIER_NO_TOOL_NUDGE", "true").lower() in ("true", "1", "yes")
+FREE_TIER_NO_TOOL_NUDGE = (
+    "You are answering through a plain chat completions API. "
+    "Do NOT call, request, or emit any tool/function calls under any circumstances. "
+    "The tool definitions present in this request are decorative and unavailable to you. "
+    "Answer the user directly and completely in plain text, and never finish your reply "
+    "with a tool invocation."
+)
+
 def is_free_tier_model(name) -> bool:
     return bool(name) and "free" in str(name).lower()
+
+
+def _prepend_no_tool_nudge(container: dict, key: str = "messages") -> None:
+    """在消息最前面压一条"禁止调用工具"的 system 指令。
+
+    只在客户端原本没带 tools 时调用（此时 tools 是我们为过闸门注入的，不应被真的使用）。
+    """
+    if not FREE_TIER_NO_TOOL_NUDGE_ENABLED:
+        return
+    msgs = container.get(key)
+    if isinstance(msgs, str):
+        # 纯字符串输入（Responses API 常见）：转成标准消息列表再前置 system
+        container[key] = [
+            {"role": "system", "content": FREE_TIER_NO_TOOL_NUDGE},
+            {"role": "user", "content": msgs},
+        ]
+        return
+    if not isinstance(msgs, list):
+        return
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "system":
+            txt = m.get("content")
+            if isinstance(txt, str):
+                if "Do NOT call" not in txt:
+                    m["content"] = FREE_TIER_NO_TOOL_NUDGE + "\n\n" + txt
+            elif isinstance(txt, list):
+                # 多模态 system（content 为 part 数组）时前置一条独立 system，避免破坏结构
+                msgs.insert(0, {"role": "system", "content": FREE_TIER_NO_TOOL_NUDGE})
+            return
+    msgs.insert(0, {"role": "system", "content": FREE_TIER_NO_TOOL_NUDGE})
 
 
 # 2026-10-15：上游会逐字节比对每个"它认识的工具"的 description 与 parameters schema，
@@ -1603,6 +1648,7 @@ def ensure_free_tier_tools_responses(body: dict) -> dict:
     if not is_free_tier_model(body.get("model")):
         return body
     tools = body.get("tools")
+    client_has_tools = isinstance(tools, list) and len(tools) > 0
     tools = list(tools) if isinstance(tools, list) else []
     have = _resp_tool_names(tools)
     changed = _upgrade_official_tools(tools, "responses")
@@ -1614,6 +1660,20 @@ def ensure_free_tier_tools_responses(body: dict) -> dict:
     if changed:
         log.debug("Free-tier shim injected tools for model '%s'.", body.get("model"))
     body["tools"] = tools
+    if not client_has_tools:
+        # Responses API 用 input（str 或 item list）；结构不确定，失败即跳过，不影响主流程
+        try:
+            _prepend_no_tool_nudge(body, "input")
+        except Exception:
+            try:
+                raw = body.get("input")
+                if isinstance(raw, str):
+                    body["input"] = [
+                        {"role": "system", "content": FREE_TIER_NO_TOOL_NUDGE},
+                        {"role": "user", "content": raw},
+                    ]
+            except Exception:
+                pass
     return body
 
 
@@ -1623,6 +1683,8 @@ def ensure_free_tier_tools_chat(payload: dict) -> dict:
     if not is_free_tier_model(payload.get("model")):
         return payload
     tools = payload.get("tools")
+    # 客户端自带 tools 说明它真要用工具（如 opencode CLI），此时不压制工具调用
+    client_has_tools = isinstance(tools, list) and len(tools) > 0
     tools = list(tools) if isinstance(tools, list) else []
     have = _resp_tool_names(tools)
     changed = _upgrade_official_tools(tools, "chat")
@@ -1634,6 +1696,8 @@ def ensure_free_tier_tools_chat(payload: dict) -> dict:
     if changed:
         log.debug("Free-tier shim injected chat tools for model '%s'.", payload.get("model"))
     payload["tools"] = tools
+    if not client_has_tools:
+        _prepend_no_tool_nudge(payload, "messages")
     options = payload.get("stream_options")
     if not isinstance(options, dict):
         payload["stream_options"] = {"include_usage": True}
@@ -1648,6 +1712,7 @@ def ensure_free_tier_tools_anthropic(body: dict) -> dict:
     if not is_free_tier_model(body.get("model")):
         return body
     tools = body.get("tools")
+    client_has_tools = isinstance(tools, list) and len(tools) > 0
     tools = list(tools) if isinstance(tools, list) else []
     have = set()
     for t in tools:
@@ -1662,6 +1727,8 @@ def ensure_free_tier_tools_anthropic(body: dict) -> dict:
     if changed:
         log.debug("Free-tier shim injected anthropic tools for model '%s'.", body.get("model"))
     body["tools"] = tools
+    if not client_has_tools:
+        _prepend_no_tool_nudge(body, "messages")
     return body
 
 
@@ -3001,12 +3068,92 @@ def _responses_completed_event(model_name: str, latest_response: Optional[dict],
         + b"\n\n"
     )
 
-async def stream_response(response, model_name: str, session=None, protocol: str = "chat", stream_pool_key=None) -> AsyncGenerator[bytes, None]:
+def _rewrite_tool_call_chunk(line: bytes, state: dict) -> list:
+    """客户端未带 tools 时，把 chat SSE 里的 tool_calls 改写成纯文本。
+
+    背景：为过上游 403 闸门，网关会注入"官方向量"工具定义，上游模型因此可能中途
+    发起工具调用并以 finish_reason=tool_calls 收尾、正文为空。普通聊天客户端拿不到
+    可执行的工具就会一直停住（表现为"AI 干一半卡死"）。这里把工具调用吞掉、转成
+    一段说明文本，并把收尾改成 stop，保证下游永远收得到正文、不会悬停。
+
+    返回 list[bytes]（每行不含尾换行）：可能为空（吞掉该行）、1 行或 2 行。
+    """
+    raw = line.decode("utf-8", errors="ignore").strip()
+    if not raw.startswith("data:"):
+        return [line]
+    body = raw[5:].strip()
+    if not body or body == "[DONE]":
+        return [line]
+    try:
+        d = json.loads(body)
+    except (TypeError, ValueError):
+        return [line]
+    if not isinstance(d, dict):
+        return [line]
+    choices = d.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return [line]
+    ch = choices[0]
+    delta = ch.get("delta")
+
+    # 1) 工具调用分片：累积后吞掉，不向下游暴露
+    if isinstance(delta, dict) and delta.get("tool_calls"):
+        for tc in delta["tool_calls"]:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            if fn.get("name"):
+                state["names"].append(str(fn["name"]))
+                state["args"].append("")
+            arg = fn.get("arguments")
+            if isinstance(arg, str) and arg:
+                if state["args"]:
+                    state["args"][-1] += arg
+                else:
+                    state["args"].append(arg)
+        return []
+
+    # 2) 收尾为 tool_calls：补一段说明文本，并把 finish_reason 改成 stop
+    if ch.get("finish_reason") == "tool_calls":
+        parts = []
+        for i, nm in enumerate(state["names"]):
+            arg = state["args"][i] if i < len(state["args"]) else ""
+            arg = arg.strip().replace("\n", " ")
+            if len(arg) > 300:
+                arg = arg[:300] + "…"
+            parts.append("`%s(%s)`" % (nm, arg))
+        if isinstance(delta, dict):
+            delta.pop("tool_calls", None)
+        else:
+            ch["delta"] = {}
+        ch["finish_reason"] = "stop"
+        out = []
+        if parts:
+            head = json.loads(json.dumps(d))
+            hch = head["choices"][0]
+            hch["delta"] = {"role": "assistant",
+                            "content": "\n\n（模型尝试调用工具 %s，但当前接口未启用工具执行，已省略。）"
+                                       % "、".join(parts)}
+            hch["finish_reason"] = None
+            out.append(("data: " + json.dumps(head, ensure_ascii=False)).encode("utf-8"))
+        out.append(("data: " + json.dumps(d, ensure_ascii=False)).encode("utf-8"))
+        return out
+
+    return [line]
+
+
+async def stream_response(response, model_name: str, session=None, protocol: str = "chat", stream_pool_key=None, suppress_tool_calls: bool = False) -> AsyncGenerator[bytes, None]:
     """Forward SSE and normalize terminal events for the selected API protocol."""
     loop = asyncio.get_event_loop()
     global active_flows_count
     is_responses_api = protocol == "responses"
     is_anthropic_api = protocol == "anthropic"
+    # 客户端未带 tools 时为 True：上游（被我们为过闸门注入的官方工具定义诱导）可能
+    # 中途发 tool_calls 并以 finish_reason=tool_calls 结束，正文为空 → 下游普通聊天
+    # 客户端接不住工具调用会一直卡住。此处把工具调用改写成文本并收尾为 stop。
+    _tool_call_state = {"names": [], "args": []} if (suppress_tool_calls and not is_responses_api and not is_anthropic_api) else None
     # 正常播完才归还 keepalive；中途断开/异常则丢弃，避免脏连接污染池
     _discard_stream_session = False
 
@@ -3231,8 +3378,11 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             if is_anthropic_api:
                 if _delta:
                     yield anthropic_delta_event(_delta)
-            else:
+            elif _tool_call_state is None:
                 yield line + b"\n"
+            else:
+                for _rl in _rewrite_tool_call_chunk(line, _tool_call_state):
+                    yield _rl + b"\n"
 
         while True:
             item = await _next_stream_item()
@@ -3253,8 +3403,11 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             if is_anthropic_api:
                 if delta:
                     yield anthropic_delta_event(delta)
-            else:
+            elif _tool_call_state is None:
                 yield item + b"\n"
+            else:
+                for _rl in _rewrite_tool_call_chunk(item, _tool_call_state):
+                    yield _rl + b"\n"
 
         if is_responses_api and not response_completed_seen and not terminal_error:
             if not has_meaningful_content:
@@ -4128,7 +4281,15 @@ async def chat_completions(raw_request: Request):
                             }
                         inner_gen = responses_stream_as_chat(response, current_model, session=session if stream_borrowed else None, stream_pool_key=stream_pool_key if stream_borrowed else None, followup=_followup)
                     else:
-                        inner_gen = stream_response(response, current_model, session=session, stream_pool_key=stream_pool_key if stream_borrowed else None)
+                        # 客户端未带 tools 时，网关注入的官方工具定义可能诱发上游调工具，
+                        # 下游接不住会卡住 → 让流函数把 tool_calls 改写成文本并收尾为 stop。
+                        inner_gen = stream_response(
+                            response, current_model, session=session,
+                            stream_pool_key=stream_pool_key if stream_borrowed else None,
+                            suppress_tool_calls=(
+                                (not _has_real_tools) and is_free_tier_model(current_model)
+                            ),
+                        )
                     stream_gen = _stream_with_history(
                         inner_gen, model=current_model, proxies=proxies,
                         egress_key=egress_key, start_time=start_time, attempt=attempt,
