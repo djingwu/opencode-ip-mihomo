@@ -3131,9 +3131,25 @@ async def recover_from_rate_limit(
     stream_pool_key=None,
     session_key: str = "",
     current_proxy: str = "",
+    start_time: float = 0,
 ) -> bool:
     """Retry a transient 429 once on the same IP before considering rotation."""
     category, retry_after, _ = classify_upstream_429(response)
+    # 中间态 429 可见性：每次上游 429 都记一行 retrying（最终成功/失败另有终态行），
+    # 否则请求历史里完全看不到限流过程。记录失败不影响主流程。
+    try:
+        record_request_history(
+            model=model_name,
+            proxy_ip=current_proxy or "",
+            egress_ip=egress_key,
+            latency_ms=round((time.time() - start_time) * 1000, 1) if start_time else 0,
+            status="retrying",
+            is_stream=not pooled,
+            attempt=attempt,
+            error_msg=f"upstream_429[{category}] retry_after={retry_after}s",
+        )
+    except Exception:
+        pass
     if category == "quota":
         # 日配额类 429：记下该出口该模型的冷却，供选路和面板使用
         try:
@@ -4411,7 +4427,7 @@ async def chat_completions(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, current_model)
-                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
+                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or "", start_time=start_time):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -4875,7 +4891,7 @@ async def anthropic_messages(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
+                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or "", start_time=start_time):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -5080,7 +5096,7 @@ async def responses_endpoint(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
+                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or "", start_time=start_time):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:

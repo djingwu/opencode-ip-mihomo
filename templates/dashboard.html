@@ -1487,6 +1487,8 @@
             tbody.innerHTML = data.history.map(r => {
                 const statusBadge = r.status === 'ok'
                     ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-green-50 text-green-700 border border-green-200">成功</span>'
+                    : r.status === 'retrying'
+                    ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">重试</span>'
                     : '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-red-50 text-red-700 border border-red-200">失败</span>';
                 const streamBadge = r.is_stream
                     ? '<span class="text-slate-500">是</span>'
