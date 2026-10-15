@@ -1830,6 +1830,30 @@ def _resp_tool_names(tools) -> set:
     return names
 
 
+# 2026-10-15：spark 等 reasoning 模型默认思考量极大，小 budget 全烧在 reasoning 上
+# 导致空回（finish=length、正文为空）。免费层默认 minimal（实测 53 token/2s 出正文，
+# 默认要烧 357+ token 且经常超 budget）；下游显式指定则尊重；设为 none 即关闭。
+RESPONSES_REASONING_EFFORT = os.environ.get("RESPONSES_REASONING_EFFORT", "minimal").strip().lower()
+
+
+def _ensure_reasoning_effort(body: dict) -> dict:
+    """免费层 responses 请求默认 reasoning effort（下游显式指定则不动）。"""
+    if not isinstance(body, dict):
+        return body
+    if not RESPONSES_REASONING_EFFORT or RESPONSES_REASONING_EFFORT == "none":
+        return body
+    cur = body.get("reasoning")
+    if isinstance(cur, dict):
+        if cur.get("effort"):
+            return body  # 下游显式指定，尊重
+        cur = dict(cur)
+        cur["effort"] = RESPONSES_REASONING_EFFORT
+        body["reasoning"] = cur
+        return body
+    body["reasoning"] = {"effort": RESPONSES_REASONING_EFFORT}
+    return body
+
+
 def _upgrade_official_tools(tools: list, protocol: str) -> bool:
     """把客户端声明的"上游认识"的工具定义就地替换成官方向量定义。
 
@@ -1892,6 +1916,7 @@ def ensure_free_tier_tools_responses(body: dict) -> dict:
                     ]
             except Exception:
                 pass
+    _ensure_reasoning_effort(body)
     return body
 
 
@@ -2462,6 +2487,17 @@ async def responses_stream_as_chat(response, model_name: str, session=None, stre
                      model_name, _depth, _text_len, _text_head, len(done_calls),
                      [c.get("name") for c in done_calls], finish_reason, saw_completed)
         yield make_chunk({}, finish_reason)
+        # OpenAI 流式约定：尾部附 usage 块，下游计费/统计靠它；
+        # responses 转 chat 流之前从不发 usage，下游看到的一直是 0/0。
+        _u_in = _pick_usage_num(usage, "input_tokens", "prompt_tokens", default=0)
+        _u_out = _pick_usage_num(usage, "output_tokens", "completion_tokens", default=0)
+        if _u_in > 0 or _u_out > 0:
+            yield (b"data: " + json.dumps({
+                "id": message_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name, "choices": [],
+                "usage": {"prompt_tokens": _u_in, "completion_tokens": _u_out,
+                          "total_tokens": _u_in + _u_out},
+            }, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n")
         yield b"data: [DONE]\n\n"
 
         # 更新 token usage（responses 流独立生成器，不经过 stream_response finally，
