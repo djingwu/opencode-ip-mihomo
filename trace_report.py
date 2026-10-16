@@ -7,6 +7,7 @@
 """
 import argparse
 import collections
+import io
 import json
 import sqlite3
 import sys
@@ -36,8 +37,14 @@ def main():
     ap.add_argument("--db", default=DB)
     ap.add_argument("--client", default="")
     ap.add_argument("--json", action="store_true",
-                    help="输出 JSON 摘要（便于外部告警/看板消费）")
+                    help="只输出 JSON 摘要（便于外部告警/看板消费）")
     args = ap.parse_args()
+
+    # --json 必须只产出合法 JSON：文本报告全部吞掉，最后由 JSON 分支统一输出。
+    # 否则 pipe 给 jq/告警脚本会 JSONDecodeError（text + json 混在 stdout）。
+    _real_stdout = sys.stdout
+    if args.json:
+        sys.stdout = io.StringIO()
 
     since_ms = int((time.time() - args.hours * 3600) * 1000)
     con = sqlite3.connect("file:%s?mode=ro" % args.db, uri=True)
@@ -220,6 +227,7 @@ def main():
 
     # ---------- 8. JSON 摘要（供告警 / 看板消费）----------
     if args.json:
+        sys.stdout = _real_stdout   # 先还原，JSON 必须是唯一输出
         _ok = len(ok)
         _ttft = sorted([r["ttft_ms"] for r in R if r["ttft_ms"] is not None])
         _tot = sorted([r["total_ms"] for r in R if r["total_ms"] is not None])
