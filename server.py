@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -1350,6 +1351,19 @@ METRICS_FLUSH_MAX_ROWS = max(10, int(os.environ.get("METRICS_FLUSH_MAX_ROWS", "2
 REQUEST_HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("REQUEST_HISTORY_RETENTION_DAYS", "7")))
 REQUEST_HISTORY_MAX_ROWS = max(1000, int(os.environ.get("REQUEST_HISTORY_MAX_ROWS", "10000")))
 RATE_LIMIT_ROTATION_THRESHOLD = max(1, int(os.environ.get("RATE_LIMIT_ROTATION_THRESHOLD", "2")))
+
+# 2026-10-16：凭据级限流识别。
+# 实测 7 次 exhausted 全是 429，且每次出口都不同（121/123/124/125/127/129），
+# 换 IP 后仍 429 —— 说明匿名通道 Bearer public 的限流是凭据级（全局共享），
+# 不按出口计。继续轮换只会把健康出口拖进冷却并空转 12-14s。
+#
+# CREDENTIAL_LIMIT_ROTATION_BUDGET = 单次请求内最多因 429 轮换几次出口。
+# 用完后再遇 429 → 判定凭据级，快速失败并把 Retry-After 透给下游自行退避。
+CREDENTIAL_LIMIT_ROTATION_BUDGET = max(
+    0, int(os.environ.get("CREDENTIAL_LIMIT_ROTATION_BUDGET", "1")))
+# 判定为凭据级后是否跳过 per-egress 配额记录（跳过可避免误伤健康出口）
+CREDENTIAL_LIMIT_SKIP_QUOTA = os.environ.get(
+    "CREDENTIAL_LIMIT_SKIP_QUOTA", "true").lower() in ("true", "1", "yes")
 # key 级长封禁阈值（秒）：retry-after 超过它说明不是 IP 级瞬时限流，
 # 换出口也无用，直接快速失败并把 Retry-After 透给下游退避。
 LONG_BAN_THRESHOLD_SECONDS = max(30, int(os.environ.get("LONG_BAN_THRESHOLD_SECONDS", "120")))
@@ -3234,6 +3248,19 @@ async def pace_egress_request(proxies: Optional[Dict[str, str]]) -> str:
     return egress_key
 
 
+# 单次请求内因 429 轮换出口的次数（凭据级限流判定用）。
+#
+# 必须用 ContextVar 而非模块级 global：asyncio 单线程但协程会交错，
+# 模块级变量会让 A 请求的轮换次数被 B 请求读到，导致 B 误判「已轮换过」
+# 而放弃本该有效的轮换。每个请求在 attempt 循环开始时 reset()。
+_rate_limit_rotations: contextvars.ContextVar = contextvars.ContextVar(
+    "rate_limit_rotations", default=0)
+
+
+def _reset_rate_limit_rotations() -> None:
+    _rate_limit_rotations.set(0)
+
+
 async def rotate_egress_safely(reason: str) -> tuple[bool, Optional[str]]:
     """Serialize a route switch and keep new model requests out of the transition."""
     async with _egress_rotation_lock:
@@ -3255,8 +3282,32 @@ async def recover_from_rate_limit(
     stream_pool_key=None,
     session_key: str = "",
     current_proxy: str = "",
+    rotation_used: bool = False,
 ) -> bool:
-    """Retry a transient 429 once on the same IP before considering rotation."""
+    """Retry a transient 429 once on the same IP before considering rotation.
+
+    rotation_used: 本次请求此前是否已因 429 轮换过出口。若已轮换过仍然 429，
+    说明限流是凭据级而非出口级，此时快速失败（返回 False）让调用方透传 429，
+    不再继续轮换把健康出口拖进冷却。
+    """
+    # ── 凭据级限流：已轮换过出口仍 429 ──
+    if rotation_used:
+        if CREDENTIAL_LIMIT_SKIP_QUOTA:
+            # 凭据级限流不是这个出口的配额问题，记冷却会误伤健康出口
+            log.warning(
+                "429 for '%s' on %s persists AFTER egress rotation -> treating as "
+                "credential-level limit (not per-egress); passing through without "
+                "further rotation.",
+                model_name, egress_key,
+            )
+        else:
+            try:
+                proxy_pool.record_upstream_quota(
+                    current_proxy or None, model_name, None, "credential_limit")
+            except Exception as exc:
+                log.warning("Record quota failed: %s", exc)
+        return False
+
     category, retry_after, _ = classify_upstream_429(response)
     if category == "quota":
         # 日配额类 429：记下该出口该模型的冷却，供选路和面板使用
@@ -3341,6 +3392,15 @@ async def recover_from_rate_limit(
 
     if not ROTATE_ON_429 or attempt >= MAX_RETRIES_ON_429:
         return False
+    # 轮换预算用尽：再换也只是徒劳（凭据级限流），直接失败让下游退避
+    _rl_used = _rate_limit_rotations.get()
+    if _rl_used >= CREDENTIAL_LIMIT_ROTATION_BUDGET:
+        log.warning(
+            "429 for '%s' on %s; egress-rotation budget (%d/%d) already spent -> "
+            "likely credential-level limit, passing through.",
+            model_name, egress_key, _rl_used, CREDENTIAL_LIMIT_ROTATION_BUDGET,
+        )
+        return False
 
     # 给被 429 的旧出口记冷却，避免换出口后它立刻又被选中（否则会秒级横扫出口池）
     try:
@@ -3356,11 +3416,14 @@ async def recover_from_rate_limit(
         return False
 
     _reset_request_session(endpoint, session, pooled=pooled, stream_pool_key=stream_pool_key)
+    _rl_used = _rate_limit_rotations.get() + 1
+    _rate_limit_rotations.set(_rl_used)
     if RATE_LIMIT_ROTATE_BACKOFF_SECONDS:
         await asyncio.sleep(RATE_LIMIT_ROTATE_BACKOFF_SECONDS)
     log.warning(
-        "Confirmed HTTP 429 for '%s'; egress rotated -> %s. Retrying in %.1fs.",
-        model_name, new_ip, RATE_LIMIT_ROTATE_BACKOFF_SECONDS,
+        "Confirmed HTTP 429 for '%s'; egress rotated -> %s (%d/%d). Retrying in %.1fs.",
+        model_name, new_ip, _rl_used,
+        CREDENTIAL_LIMIT_ROTATION_BUDGET, RATE_LIMIT_ROTATE_BACKOFF_SECONDS,
     )
     return True
 
@@ -4545,6 +4608,8 @@ async def chat_completions(raw_request: Request):
             log.warning("Title-triggered egress advance failed: %s", exc)
 
     consecutive_timeouts = 0
+    # 凭据级限流判定：本次请求的 429 轮换计数从零开始
+    _reset_rate_limit_rotations()
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         stream_pool_key = None
@@ -4586,7 +4651,9 @@ async def chat_completions(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, current_model)
-                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
+                if await recover_from_rate_limit(response, current_model, "chat", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key,
+                                 current_proxy=_request_proxy_url(proxies) or "",
+                                 rotation_used=_rate_limit_rotations.get() > 0):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -5019,6 +5086,8 @@ async def anthropic_messages(raw_request: Request):
     session_key = headers.get("x-opencode-session", "") or client_api_key
 
     consecutive_timeouts = 0
+    # 凭据级限流判定：本次请求的 429 轮换计数从零开始
+    _reset_rate_limit_rotations()
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         stream_pool_key = None
@@ -5061,7 +5130,9 @@ async def anthropic_messages(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
+                if await recover_from_rate_limit(response, model_name, "anthropic", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key,
+                                 current_proxy=_request_proxy_url(proxies) or "",
+                                 rotation_used=_rate_limit_rotations.get() > 0):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:
@@ -5232,6 +5303,8 @@ async def responses_endpoint(raw_request: Request):
     session_key = headers.get("x-opencode-session", "") or client_key
 
     consecutive_timeouts = 0
+    # 凭据级限流判定：本次请求的 429 轮换计数从零开始
+    _reset_rate_limit_rotations()
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         stream_pool_key = None
@@ -5273,7 +5346,9 @@ async def responses_endpoint(raw_request: Request):
                     except Exception as exc:
                         log.warning("Record quota failed: %s", exc)
                     return upstream_rate_limit_response(response, model_name)
-                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key, current_proxy=_request_proxy_url(proxies) or ""):
+                if await recover_from_rate_limit(response, model_name, "responses", session, not is_stream, egress_key, attempt, stream_pool_key=stream_pool_key if stream_borrowed else None, session_key=session_key,
+                                 current_proxy=_request_proxy_url(proxies) or "",
+                                 rotation_used=_rate_limit_rotations.get() > 0):
                     stream_borrowed = False
                     continue
                 if stream_borrowed:

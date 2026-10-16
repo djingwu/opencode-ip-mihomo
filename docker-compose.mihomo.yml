@@ -89,6 +89,11 @@ services:
       # 服务端强制替换下游凭证的上游有效 key（.env 里配，从不进仓库）
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
       - RATE_LIMIT_ROTATION_THRESHOLD=${RATE_LIMIT_ROTATION_THRESHOLD:-2}
+      # 2026-10-16：凭据级限流。实测匿名通道 Bearer public 的 429 不按出口计
+      # （换 IP 后仍 429），因此限制单请求内最多轮换几次出口，用完即快速失败
+      # 并把 Retry-After 透给下游，避免空转 12-14s + 误伤健康出口冷却。
+      - CREDENTIAL_LIMIT_ROTATION_BUDGET=${CREDENTIAL_LIMIT_ROTATION_BUDGET:-1}
+      - CREDENTIAL_LIMIT_SKIP_QUOTA=${CREDENTIAL_LIMIT_SKIP_QUOTA:-true}
       - MAX_RATE_LIMIT_WAIT=${MAX_RATE_LIMIT_WAIT:-8}
       # 2026-10-14：流式上游超时可配 + 429 退避下限（防突发时秒级横扫出口池）
       - STREAM_TIMEOUT=${STREAM_TIMEOUT:-120}

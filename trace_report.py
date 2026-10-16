@@ -13,7 +13,7 @@ import sys
 import time
 
 DB = "/usr/local/ai/opencode-ip-mihomo/data/metrics.db"
-COLS = ["id", "ts", "ts_ms", "model", "endpoint", "is_stream", "client_tools",
+COLS = ["id", "ts", "ts_ms", "model", "endpoint", "client", "is_stream", "client_tools",
         "proxy_ip", "egress_ip", "ttft_ms", "total_ms", "chunks", "out_bytes",
         "status", "attempt", "finish_reason", "downstream_tool_calls",
         "upstream_status", "error_type", "prompt_tokens", "completion_tokens"]
@@ -34,6 +34,9 @@ def main():
     ap.add_argument("--hours", type=int, default=1)
     ap.add_argument("--model", default="")
     ap.add_argument("--db", default=DB)
+    ap.add_argument("--client", default="")
+    ap.add_argument("--json", action="store_true",
+                    help="输出 JSON 摘要（便于外部告警/看板消费）")
     args = ap.parse_args()
 
     since_ms = int((time.time() - args.hours * 3600) * 1000)
@@ -45,6 +48,9 @@ def main():
     if args.model:
         where.append("model = ?")
         params.append(args.model)
+    if args.client:
+        where.append("client = ?")
+        params.append(args.client)
     rows = cur.execute(
         "SELECT %s FROM request_trace WHERE %s ORDER BY id DESC"
         % (",".join(COLS), " AND ".join(where)),
@@ -53,7 +59,11 @@ def main():
     con.close()
 
     if not rows:
-        print("窗口内无 trace 记录（检查 TRACE_ENABLED / 网关是否有流量）")
+        msg = "窗口内无 trace 记录（检查 TRACE_ENABLED / 网关是否有流量）"
+        if args.json:
+            print(json.dumps({"ok": False, "reason": msg}, ensure_ascii=False))
+        else:
+            print(msg)
         return
 
     R = [dict(zip(COLS, r)) for r in rows]
@@ -106,6 +116,27 @@ def main():
     if gen:
         print("  生成段   n=%-5d min=%6.2fs p50=%6.2fs p90=%6.2fs max=%7.2fs  (total - ttft)"
               % (len(gen), secs(gen[0]), secs(pct(gen, .5)), secs(pct(gen, .9)), secs(gen[-1])))
+
+    # ---------- 3b. 客户端维度 ----------
+    print("\n  按客户端：")
+    by_cli = collections.defaultdict(list)
+    for r in R:
+        by_cli[r["client"] or "unknown"].append(r)
+    hdr2 = "  %-12s %5s %7s %9s %9s %9s" % ("client", "n", "ok%", "ttft.p50",
+                                             "total.p50", "total.max")
+    print(hdr2)
+    print("  " + "-" * (len(hdr2) - 2))
+    for cl in sorted(by_cli, key=lambda x: -len(by_cli[x])):
+        rs = by_cli[cl]
+        n_c = len(rs)
+        okc = sum(1 for r in rs if r["status"] == "ok")
+        tt = sorted([r["ttft_ms"] for r in rs if r["ttft_ms"] is not None])
+        to = sorted([r["total_ms"] for r in rs if r["total_ms"] is not None])
+        print("  %-12s %5d %6.1f%% %9s %9s %9s"
+              % (cl[:12], n_c, okc * 100.0 / n_c,
+                 ("%.1fs" % secs(pct(tt, .5))) if tt else "-",
+                 ("%.1fs" % secs(pct(to, .5))) if to else "-",
+                 ("%.1fs" % secs(to[-1])) if to else "-"))
 
     print("\n  按模型（仅成功请求）：")
     by_model = collections.defaultdict(list)
@@ -186,6 +217,45 @@ def main():
         print("  prompt tokens %d（均值 %.0f）| completion tokens %d（均值 %.0f）"
               % (tp, tp / n, tc, tc / n))
     print()
+
+    # ---------- 8. JSON 摘要（供告警 / 看板消费）----------
+    if args.json:
+        _ok = len(ok)
+        _ttft = sorted([r["ttft_ms"] for r in R if r["ttft_ms"] is not None])
+        _tot = sorted([r["total_ms"] for r in R if r["total_ms"] is not None])
+        payload = {
+            "ok": True,
+            "window_hours": args.hours,
+            "requests": n,
+            "success": _ok,
+            "failed": len(bad),
+            "success_rate": round(_ok * 100.0 / n, 2),
+            "stream_ratio": round(len(stream) * 100.0 / n, 2),
+            "retry_ratio": round(len([r for r in R if (r["attempt"] or 1) > 1])
+                               * 100.0 / n, 2),
+            "ttft_p50_ms": pct(_ttft, .5) if _ttft else None,
+            "ttft_p99_ms": pct(_ttft, .99) if _ttft else None,
+            "total_p50_ms": pct(_tot, .5) if _tot else None,
+            "total_p99_ms": pct(_tot, .99) if _tot else None,
+            "total_max_ms": _tot[-1] if _tot else None,
+            "errors": dict(errs),
+            "upstream_codes": {str(k): v for k, v in codes.items()},
+            "stall_risk_injected_tools": len(dtc_injected),
+            "by_client": {
+                cl: {
+                    "n": len(rs),
+                    "ok": sum(1 for r in rs if r["status"] == "ok"),
+                    "avg_ms": round(sum(r["total_ms"] or 0 for r in rs) / len(rs), 1),
+                } for cl, rs in sorted(by_cli.items())
+            },
+            "by_model": {
+                m: {
+                    "n": len(rs),
+                    "p50_ms": pct(sorted([r["total_ms"] for r in rs]), .5),
+                } for m, rs in sorted(by_model.items())
+            },
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
