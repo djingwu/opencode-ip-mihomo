@@ -14,7 +14,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
@@ -2089,8 +2089,11 @@ def _collect_chat_stream_blocking(response, model_name: str):
             role = delta.get("role")
         if delta.get("content"):
             content_parts.append(delta.get("content"))
-        if delta.get("reasoning"):
-            reasoning_parts.append(delta.get("reasoning"))
+        # thinking 模型（deepseek 型）上游流式下发字段是 reasoning_content，
+        # 少数上游用 reasoning；两个都收，聚合消息也双字段下发。
+        _rv = delta.get("reasoning_content") or delta.get("reasoning")
+        if _rv:
+            reasoning_parts.append(_rv)
 
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
@@ -2115,12 +2118,20 @@ def _collect_chat_stream_blocking(response, model_name: str):
 
     message = {"role": role, "content": content}
     if reasoning:
+        # 双字段下发：reasoning_content 是 DeepSeek 官方字段（严格上游回传校验
+        # 依据），reasoning 是 OpenRouter 风格（兼容部分客户端读取）
+        message["reasoning_content"] = reasoning
         message["reasoning"] = reasoning
     if tool_calls_dict:
         sorted_calls = [tool_calls_dict[k] for k in sorted(tool_calls_dict.keys())]
         message["tool_calls"] = sorted_calls
         if finish_reason == "stop":
             finish_reason = "tool_calls"
+        # 顺手把思维文本挂到本响应的 tool_call id 上，供下一轮回传注入
+        if reasoning:
+            for _tc in sorted_calls:
+                if _tc.get("id"):
+                    _reasoning_cache_put(str(_tc["id"]), reasoning)
 
     if not content and not reasoning and not tool_calls_dict:
         raise EmptyStreamError("Upstream returned empty chat stream")
@@ -2149,6 +2160,86 @@ def _collect_chat_stream_blocking(response, model_name: str):
 
 async def _collect_chat_stream(response, model_name: str):
     return await asyncio.to_thread(_collect_chat_stream_blocking, response, model_name)
+
+
+# ---------------------------------------------------------------------------
+# thinking 模型 reasoning_content 会话级回传缓存
+# 背景：部分上游（deepseek 型 thinking 通道）强制要求工具轮回传
+# reasoning_content，否则报 400 "The reasoning_content in the thinking mode
+# must be passed back to the API"。部分客户端丢弃该字段导致后续轮次被拒。
+# 修法：网关在透传/聚合上游流时按 tool_call id 缓存思维文本；客户端带
+# assistant(tool_calls) 消息回传但缺 reasoning_content 时自动补齐。
+# ---------------------------------------------------------------------------
+REASONING_PASSBACK_TTL = float(os.environ.get("REASONING_PASSBACK_TTL", "3600"))
+REASONING_PASSBACK_MAX = int(os.environ.get("REASONING_PASSBACK_MAX", "2000"))
+_reasoning_passback: Dict[str, Tuple[float, str]] = {}
+_reasoning_passback_lock = threading.Lock()
+
+
+def _reasoning_cache_put(tool_call_id: str, reasoning: str) -> None:
+    if not tool_call_id or not reasoning:
+        return
+    now = time.time()
+    with _reasoning_passback_lock:
+        _reasoning_passback[tool_call_id] = (now, reasoning)
+        if len(_reasoning_passback) > REASONING_PASSBACK_MAX:
+            _items = sorted(_reasoning_passback.items(), key=lambda kv: kv[1][0])
+            for _k, _ in _items[: max(1, len(_items) // 4)]:
+                _reasoning_passback.pop(_k, None)
+
+
+def _reasoning_cache_get(tool_call_id: str) -> str:
+    if not tool_call_id:
+        return ""
+    now = time.time()
+    with _reasoning_passback_lock:
+        _entry = _reasoning_passback.get(tool_call_id)
+        if not _entry:
+            return ""
+        _ts, _text = _entry
+        if now - _ts > REASONING_PASSBACK_TTL:
+            _reasoning_passback.pop(tool_call_id, None)
+            return ""
+        return _text
+
+
+def inject_reasoning_passback(payload: dict, model_name: str) -> int:
+    """扫描请求里的 assistant(tool_calls) 消息，缺失 reasoning_content 时补齐。
+
+    两个来源：① 网关流式透传/聚合时缓存的该 tool_call 对应思维文本；
+    ② 客户端回传了 OpenRouter 风格 reasoning 字段时转正字段名。
+    返回注入的消息条数（仅日志用）。
+    """
+    _msgs = payload.get("messages")
+    if not isinstance(_msgs, list):
+        return 0
+    _n = 0
+    for _m in _msgs:
+        if not isinstance(_m, dict) or _m.get("role") != "assistant":
+            continue
+        _tcs = _m.get("tool_calls")
+        if not isinstance(_tcs, list) or not _tcs:
+            continue
+        _existing = _m.get("reasoning_content")
+        if isinstance(_existing, str) and _existing:
+            continue
+        _text = ""
+        for _tc in _tcs:
+            if isinstance(_tc, dict):
+                _text = _reasoning_cache_get(str(_tc.get("id") or ""))
+                if _text:
+                    break
+        if _text:
+            _m["reasoning_content"] = _text
+            _m.pop("reasoning", None)
+            _n += 1
+        else:
+            _r = _m.get("reasoning")
+            if isinstance(_r, str) and _r:
+                _m["reasoning_content"] = _r
+                _m.pop("reasoning", None)
+                _n += 1
+    return _n
 
 
 def _collect_anthropic_stream_blocking(response, model_name: str):
@@ -3637,6 +3728,10 @@ async def stream_response(response, model_name: str, session=None, protocol: str
     # chat 协议流尾部 usage chunk（上游带 stream_options.include_usage 时必有）：
     # inspect_line 透传时顺手捕获，finally 统一补记真实 token。
     chat_usage: dict = {}
+    # thinking 模型回传缓存：本条响应攒 reasoning 文本 + tool_call id，
+    # finally 里 put 进会话缓存（下一轮客户端缺失时由 inject 补齐）
+    _reason_buf: list = []
+    _tc_ids_seen: set = set()
 
     def inspect_line(line: bytes) -> tuple[str, Optional[dict], str]:
         nonlocal has_meaningful_content, response_completed_seen, latest_response, pending_sse_event
@@ -3673,6 +3768,23 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                     _u = _chunk.get("usage") if isinstance(_chunk, dict) else None
                     if isinstance(_u, dict) and _u:
                         chat_usage.update(_u)
+                except (TypeError, ValueError):
+                    pass
+            # thinking 模型思维捕获：攒 reasoning 文本 + 记录 tool_call id，
+            # finally 统一写入会话级缓存供下一轮回传注入。
+            if '"reasoning_content"' in raw or '"tool_calls"' in raw or '"reasoning"' in raw:
+                try:
+                    _data_text = raw[5:].strip() if raw.startswith("data:") else raw
+                    _chunk = json.loads(_data_text)
+                    if isinstance(_chunk, dict):
+                        for _cch in _chunk.get("choices") or []:
+                            _cd = _cch.get("delta") or {}
+                            _rv = _cd.get("reasoning_content") or _cd.get("reasoning")
+                            if isinstance(_rv, str) and _rv:
+                                _reason_buf.append(_rv)
+                            for _tc in _cd.get("tool_calls") or []:
+                                if isinstance(_tc, dict) and _tc.get("id"):
+                                    _tc_ids_seen.add(str(_tc["id"]))
                 except (TypeError, ValueError):
                     pass
         if event_type == "response.completed":
@@ -3930,6 +4042,15 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             )
         except Exception:
             pass
+        # thinking 模型回传缓存：把本响应的思维文本挂到 tool_call id 上
+        if not is_responses_api and not is_anthropic_api and _tc_ids_seen and _reason_buf:
+            try:
+                _reason_text = "".join(_reason_buf)
+                if _reason_text:
+                    for _tid in _tc_ids_seen:
+                        _reasoning_cache_put(_tid, _reason_text)
+            except Exception:
+                pass
         lease_heartbeat.cancel()
         try:
             await asyncio.gather(lease_heartbeat, return_exceptions=True)
@@ -4581,6 +4702,18 @@ async def chat_completions(raw_request: Request):
         (not is_stream) and FREE_TIER_SHIM_ENABLED
         and is_free_tier_model(current_model)
     )
+    # thinking 模型回传注入（仅 chat 形态；responses-only 走 encrypted_content
+    # 另一套协议，不适用）：客户端丢弃 reasoning_content 时按 tool_call id 从
+    # 会话缓存补齐，严格上游不再 400。放 attempt 循环外只注入一次。
+    if (current_model not in RESPONSES_ONLY_MODELS
+            and isinstance(payload.get("messages"), list)):
+        try:
+            _inj = inject_reasoning_passback(payload, current_model)
+            if _inj:
+                log.info("reasoning passback injected into %d assistant msg(s) model=%s client=%s",
+                         _inj, current_model, _client_tag)
+        except Exception as exc:
+            log.warning("reasoning passback injection failed: %s", exc)
 
     client_key = raw_request.headers.get("x-api-key", "") or raw_request.headers.get("authorization", "")
     headers = get_realistic_headers(client_key)
