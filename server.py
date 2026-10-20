@@ -2170,8 +2170,15 @@ async def _collect_chat_stream(response, model_name: str):
 # 修法：网关在透传/聚合上游流时按 tool_call id 缓存思维文本；客户端带
 # assistant(tool_calls) 消息回传但缺 reasoning_content 时自动补齐。
 # ---------------------------------------------------------------------------
-REASONING_PASSBACK_TTL = float(os.environ.get("REASONING_PASSBACK_TTL", "3600"))
+# 默认 TTL 24h：会话经常挂数小时后才继续，缓存过期会让严格上游重新 400；
+# 容量上限仍保护内存（超量淘汰最旧 1/4）。
+REASONING_PASSBACK_TTL = float(os.environ.get("REASONING_PASSBACK_TTL", "86400"))
 REASONING_PASSBACK_MAX = int(os.environ.get("REASONING_PASSBACK_MAX", "2000"))
+# reasoning 回传强校验的厂商特征：模型名命中即视作 thinking 严格上游
+# （参考 opencode2api reasoningVendorHints，另加 glm）
+REASONING_REPLAY_VENDORS = ("deepseek", "kimi", "moonshot", "mimo", "xiaomimimo", "glm")
+# 缓存未命中时的占位思维内容（opencode2api 同款做法）
+REASONING_TOOL_PLACEHOLDER = "tool call"
 _reasoning_passback: Dict[str, Tuple[float, str]] = {}
 _reasoning_passback_lock = threading.Lock()
 
@@ -2206,13 +2213,16 @@ def _reasoning_cache_get(tool_call_id: str) -> str:
 def inject_reasoning_passback(payload: dict, model_name: str) -> int:
     """扫描请求里的 assistant(tool_calls) 消息，缺失 reasoning_content 时补齐。
 
-    两个来源：① 网关流式透传/聚合时缓存的该 tool_call 对应思维文本；
-    ② 客户端回传了 OpenRouter 风格 reasoning 字段时转正字段名。
+    补齐优先级：① 网关缓存的该 tool_call 真实思维文本；② 客户端回传的
+    OpenRouter 风格 reasoning 字符串；③ thinking 严格上游（模型名命中
+    REASONING_REPLAY_VENDORS）在① ② 都落空时填占位符兜底。
     返回注入的消息条数（仅日志用）。
     """
     _msgs = payload.get("messages")
     if not isinstance(_msgs, list):
         return 0
+    _model = (model_name or "").lower()
+    _vendor = any(_h in _model for _h in REASONING_REPLAY_VENDORS)
     _n = 0
     for _m in _msgs:
         if not isinstance(_m, dict) or _m.get("role") != "assistant":
@@ -2229,17 +2239,39 @@ def inject_reasoning_passback(payload: dict, model_name: str) -> int:
                 _text = _reasoning_cache_get(str(_tc.get("id") or ""))
                 if _text:
                     break
+        if not _text:
+            _r = _m.get("reasoning")
+            if isinstance(_r, str) and _r:
+                _text = _r
+        if not _text and _vendor:
+            # 兜底：缓存未命中（网关重启 / TTL 过期 / 客户端改写 id /
+            # 部署前的历史轮次）时，严格上游仍要求该字段存在——
+            # 填占位符好过整轮 400。参考 opencode2api
+            # normalizeToolReasoningHistory 的同款兜底。
+            _text = REASONING_TOOL_PLACEHOLDER
         if _text:
             _m["reasoning_content"] = _text
             _m.pop("reasoning", None)
             _n += 1
-        else:
-            _r = _m.get("reasoning")
-            if isinstance(_r, str) and _r:
-                _m["reasoning_content"] = _r
-                _m.pop("reasoning", None)
-                _n += 1
     return _n
+
+
+def build_upstream_stream_error_sse(status_code: int, error_body: str, model: str) -> str:
+    """上游出错时下发 SSE 的形态。
+
+    error（默认）：结构化错误块 data: {"error": {...}}，客户端能识别为
+    失败并重试 / 切换模型，不再把上游错误伪装成一次"正常结束"——
+    旧行为让会话在错误文本上继续，越滚越歪（opencode2api issue #11 同款）。
+    content：旧行为，错误文本塞进助手内容 + finish_reason=stop，
+    用 STREAM_UPSTREAM_ERROR_MODE=content 可回退。
+    """
+    if (STREAM_UPSTREAM_ERROR_MODE or "error").lower() == "content":
+        return f'data: {json.dumps({"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"[Upstream {status_code}] {error_body}"}, "finish_reason": "stop"}]}, ensure_ascii=False, separators=(",", ":"))}\n\n'
+    return f'data: {json.dumps({"error": {"message": f"[Upstream {status_code}] {error_body}", "type": "upstream_error", "code": str(status_code)}}, ensure_ascii=False, separators=(",", ":"))}\n\n'
+
+
+# 流式上游出错下发形态：error=结构化错误（默认）；content=旧行为
+STREAM_UPSTREAM_ERROR_MODE = os.environ.get("STREAM_UPSTREAM_ERROR_MODE", "error")
 
 
 def _collect_anthropic_stream_blocking(response, model_name: str):
@@ -4898,14 +4930,8 @@ async def chat_completions(raw_request: Request):
                         _release_stream_session(stream_pool_key, session, discard=True)
                         stream_borrowed = False
                     log.warning("Upstream error body for '%s': %s", current_model, error_body[:500])
-                    error_chunk = {
-                        "id": f"chatcmpl-{int(time.time())}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": current_model,
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"[Upstream {response.status_code}] {error_body}"}, "finish_reason": "stop"}]
-                    }
-                    error_sse = f"data: {json.dumps(error_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    error_sse = build_upstream_stream_error_sse(
+                        response.status_code, error_body[:500], current_model)
                     record_request_history(
                         model=current_model,
                         proxy_ip=_request_proxy_url(proxies) or "",
