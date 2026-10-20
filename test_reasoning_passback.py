@@ -154,6 +154,50 @@ if server is not None:
     check("content 模式保持旧行为", '"choices"' in _old and '"finish_reason":"stop"' in _old)
 
 
+    # ---- ② 无工具轮 content 兜底（glm 型 400） ----
+    _p2 = {"messages": [
+        {"role": "user", "content": "hi"},
+        # 纯思考轮：只有 reasoning、content 缺失 —— glm 上游会 400
+        {"role": "assistant", "reasoning": "thinking..."},
+        {"role": "user", "content": "go"},
+    ]}
+    _n2 = server.inject_reasoning_passback(_p2, "glm-5.3-flash-free")
+    check("vendor 空 content 轮被补占位", _p2["messages"][1].get("content") == server.EMPTY_CONTENT_PLACEHOLDER)
+    check("原 reasoning 字段保留", _p2["messages"][1].get("reasoning") == "thinking...")
+    check("content 兜底计数", _n2 == 1)
+
+    # content=None / "" / [] 三种空形态都要补
+    _p2b = {"messages": [
+        {"role": "assistant", "reasoning": "x", "content": None},
+        {"role": "assistant", "reasoning": "y", "content": ""},
+        {"role": "assistant", "content": [], "reasoning": "z"},
+    ]}
+    _n2b = server.inject_reasoning_passback(_p2b, "glm-5.3-flash-free")
+    check("None/空串/空list 都被补", all(m.get("content") == server.EMPTY_CONTENT_PLACEHOLDER for m in _p2b["messages"]))
+    check("三个空轮都计数", _n2b == 3)
+
+    # 非 vendor 模型不动
+    _p2c = {"messages": [{"role": "assistant", "reasoning": "x"}]}
+    _n2c = server.inject_reasoning_passback(_p2c, "step-5-preview-free")
+    check("非 vendor 空 content 轮不补", _p2c["messages"][0].get("content") in (None, "") and _n2c == 0)
+
+    # content 非空不覆盖
+    _p2d = {"messages": [{"role": "assistant", "reasoning": "x", "content": "已有内容"}]}
+    _n2d = server.inject_reasoning_passback(_p2d, "glm-5.3-flash-free")
+    check("content 非空不被覆盖", _p2d["messages"][0]["content"] == "已有内容" and _n2d == 0)
+
+    # 带 tool_calls 的空 content 轮不被 ② 误伤：仍只走 reasoning 路径
+    _p2e = {"messages": [{"role": "assistant", "content": "", "tool_calls": [
+        {"id": "tc_x", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}]}
+    _n2e = server.inject_reasoning_passback(_p2e, "glm-5.3-flash-free")
+    check("带工具空 content 轮只补 reasoning", _p2e["messages"][0].get("content") == ""
+          and _p2e["messages"][0].get("reasoning_content") == server.REASONING_TOOL_PLACEHOLDER)
+
+    # deepseek 同样命中（vendor set 覆盖）
+    _p2g = {"messages": [{"role": "assistant", "reasoning": "x"}]}
+    _n2g = server.inject_reasoning_passback(_p2g, "deepseek-v4.1-flash-free")
+    check("deepseek 空 content 轮也补", _p2g["messages"][0].get("content") == server.EMPTY_CONTENT_PLACEHOLDER and _n2g == 1)
+
 if server is not None:
     print("\n%d failed" % len(fails))
     sys.exit(1 if fails else 0)

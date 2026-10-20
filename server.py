@@ -2179,6 +2179,9 @@ REASONING_PASSBACK_MAX = int(os.environ.get("REASONING_PASSBACK_MAX", "2000"))
 REASONING_REPLAY_VENDORS = ("deepseek", "kimi", "moonshot", "mimo", "xiaomimimo", "glm")
 # 缓存未命中时的占位思维内容（opencode2api 同款做法）
 REASONING_TOOL_PLACEHOLDER = "tool call"
+# 无工具轮的 assistant 纯思考轮缺 content 时的占位（glm 等上游要求
+# 非工具轮必须有 content，见 inject_reasoning_passback ②）
+EMPTY_CONTENT_PLACEHOLDER = "..."
 _reasoning_passback: Dict[str, Tuple[float, str]] = {}
 _reasoning_passback_lock = threading.Lock()
 
@@ -2211,12 +2214,15 @@ def _reasoning_cache_get(tool_call_id: str) -> str:
 
 
 def inject_reasoning_passback(payload: dict, model_name: str) -> int:
-    """扫描请求里的 assistant(tool_calls) 消息，缺失 reasoning_content 时补齐。
+    """扫描请求里的 assistant 消息，修两种客户端历史不规范导致的 400。
 
-    补齐优先级：① 网关缓存的该 tool_call 真实思维文本；② 客户端回传的
-    OpenRouter 风格 reasoning 字符串；③ thinking 严格上游（模型名命中
-    REASONING_REPLAY_VENDORS）在① ② 都落空时填占位符兜底。
-    返回注入的消息条数（仅日志用）。
+    ① 带 tool_calls 的轮缺 reasoning_content（deepseek/v4.1 思考模式强校验
+    "must be passed back"）：优先级为 a. 网关缓存的真实思维文本 →
+    b. 客户端回传的 reasoning 字符串 → c. vendor 命中时占位符兜底。
+    ② 无 tool_calls 的纯思考轮既无 content：glm 等上游要求非工具轮必须有
+    content（"content is required when tool_calls is absent"），vendor 命中
+    时补 content 占位符。
+    返回修补的消息条数（仅日志用）。
     """
     _msgs = payload.get("messages")
     if not isinstance(_msgs, list):
@@ -2229,6 +2235,15 @@ def inject_reasoning_passback(payload: dict, model_name: str) -> int:
             continue
         _tcs = _m.get("tool_calls")
         if not isinstance(_tcs, list) or not _tcs:
+            # 无工具轮的 assistant 历史：glm 等上游要求非工具轮必须有
+            # content，客户端"纯思考轮"（只有 reasoning、content 为空）
+            # 会让整轮 400：
+            #   [invalid_value] messages[N]: content is required when
+            #   "tool_calls" is absent
+            # vendor 命中时补占位符，与 ① 的 reasoning 兜底同思路。
+            if _vendor and not _m.get("content"):
+                _m["content"] = EMPTY_CONTENT_PLACEHOLDER
+                _n += 1
             continue
         _existing = _m.get("reasoning_content")
         if isinstance(_existing, str) and _existing:
