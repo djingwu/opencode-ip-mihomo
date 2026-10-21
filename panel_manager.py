@@ -20,7 +20,7 @@ from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional
 
 from curl_cffi import requests
-from proxy_utils import normalize_proxy_url
+from proxy_utils import normalize_proxy_url, with_v6_mark, strip_v6_mark
 import proxy_pool
 
 log = logging.getLogger("panel")
@@ -2065,12 +2065,30 @@ def remove_selected_nodes(node_names: List[str]) -> Dict[str, Any]:
 # 与 server.py 的 PROXY_FILE 共享同一文件；health check 测延迟/连通性
 # -----------------------------------------------------------------------------
 PROXY_LIST_FILE = Path(os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt"))
+PROXY_LIST_FILE_V6 = Path(os.environ.get("PROXY_LIST_FILE_V6", "/app/data/proxies-v6.txt"))
+SOCKS_V6_MARK = "#v6"
 # 代理状态持久化（延迟/失败次数/冷却至）
 PROXY_STATE_FILE = Path(os.environ.get("PROXY_STATE_FILE", "/app/data/proxy_state.json"))
 
 # 冷却时间（秒）：失败次数越多，冷却越长
 PROXY_COOLDOWN_BASE = int(os.environ.get("PROXY_COOLDOWN_BASE", "60"))
 PROXY_COOLDOWN_FACTOR = int(os.environ.get("PROXY_COOLDOWN_FACTOR", "30"))
+
+
+def _read_proxy_file_all() -> List[str]:
+    """合并 v4 + v6 池条目。v6 条目带 SOCKS_V6_MARK 后缀（与 rotator/
+    server 池口径一致）；proxy_state 也按带标记的 URL 记账，故查状态必用原样。
+    展示时由调用方剥掉后缀。"""
+    items = _read_proxy_file()
+    v6_items = []
+    if PROXY_LIST_FILE_V6.exists():
+        try:
+            with open(PROXY_LIST_FILE_V6, "r", encoding="utf-8") as f:
+                v6_items = [with_v6_mark(normalize_proxy_url(ln)) for ln in f
+                            if ln.strip() and not ln.startswith("#")]
+        except Exception:
+            v6_items = []
+    return list(dict.fromkeys(list(items) + [v for v in v6_items if v]))
 
 
 def _read_proxy_file() -> List[str]:
@@ -2084,6 +2102,27 @@ def _read_proxy_file() -> List[str]:
     except Exception as e:
         log.warning("read proxies.txt failed: %s", e)
         return []
+
+
+def _read_raw_file(path: Path) -> List[str]:
+    """读文件原样行（不归一、不加标记），用于 v6 文件删除匹配。"""
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except Exception:
+        return []
+
+
+def _write_raw_file(path: Path, proxies: List[str]) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for p in proxies:
+                f.write(p + "\n")
+        return True
+    except Exception:
+        return False
 
 
 def _write_proxy_file(proxies: List[str]) -> bool:
@@ -2118,7 +2157,7 @@ def _save_proxy_state(st: Dict[str, Any]) -> bool:
 
 def list_proxies() -> Dict[str, Any]:
     """返回代理列表 + 每个代理的状态（延迟/失败次数/冷却至/状态/上游配额冷却）。"""
-    proxies = _read_proxy_file()
+    proxies = _read_proxy_file_all()
     state = _load_proxy_state()
     now = time.time()
     items = []
@@ -2154,7 +2193,9 @@ def list_proxies() -> Dict[str, Any]:
         except Exception:
             quota_view = {}
         items.append({
-            "addr": addr,
+            "addr": strip_v6_mark(addr),
+            "addr_raw": addr,
+            "family": "ipv6" if SOCKS_V6_MARK in addr else "ipv4",
             "status": status,
             "latency": s.get("latency"),           # ms 或 None
             "fail_count": s.get("fail_count", 0),
@@ -2188,11 +2229,18 @@ def add_proxies(text: str) -> Dict[str, Any]:
 
 
 def remove_proxy(addr: str) -> Dict[str, Any]:
-    proxies = _read_proxy_file()
-    if addr not in proxies:
+    is_v6 = SOCKS_V6_MARK in addr
+    target_file = PROXY_LIST_FILE_V6 if is_v6 else PROXY_LIST_FILE
+    if is_v6:
+        proxies = _read_raw_file(PROXY_LIST_FILE_V6)
+        clean = strip_v6_mark(normalize_proxy_url(addr))
+    else:
+        proxies = _read_proxy_file()
+        clean = normalize_proxy_url(addr)
+    if clean not in proxies:
         return {"ok": False, "error": "代理不存在"}
-    proxies.remove(addr)
-    ok = _write_proxy_file(proxies)
+    proxies.remove(clean)
+    ok = _write_raw_file(target_file, proxies)
     # 清理状态
     st = _load_proxy_state()
     st.pop(addr, None)
@@ -2222,10 +2270,10 @@ def _test_one_proxy(addr: str) -> Dict[str, Any]:
 
 def check_proxies(addrs: Optional[List[str]] = None) -> Dict[str, Any]:
     """健康检查：测试指定代理或全部。更新状态并持久化。"""
-    proxies = _read_proxy_file()
+    proxies = _read_proxy_file_all()
     if addrs:
         requested = {normalize_proxy_url(a) for a in addrs}
-        targets = [a for a in proxies if a in requested]
+        targets = [a for a in proxies if strip_v6_mark(a).replace(SOCKS_V6_MARK, "") in requested or a in requested]
     else:
         targets = proxies
     state = _load_proxy_state()

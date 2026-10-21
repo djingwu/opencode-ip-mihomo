@@ -384,7 +384,7 @@
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
                     <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
-                        <tr><th class="px-5 py-2.5">地址</th><th class="px-5 py-2.5">状态</th><th class="px-5 py-2.5 text-right">耗时</th><th class="px-5 py-2.5 text-right">失败次数</th><th class="px-5 py-2.5">冷却至</th><th class="px-5 py-2.5 text-right">操作</th></tr>
+                        <tr><th class="px-5 py-2.5">地址</th><th class="px-5 py-2.5">协议族</th><th class="px-5 py-2.5">状态</th><th class="px-5 py-2.5 text-right">耗时</th><th class="px-5 py-2.5 text-right">失败次数</th><th class="px-5 py-2.5">冷却至</th><th class="px-5 py-2.5 text-right">操作</th></tr>
                     </thead>
                     <tbody id="proxy-table-body" class="divide-y divide-slate-100 text-slate-700">
                         <tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无代理，请在上方添加。</td></tr>
@@ -1357,21 +1357,26 @@
                 document.getElementById('proxy-count-badge').textContent = (data.total || 0) + ' 个';
                 loadProxyRouteStatus();
                 if (!data.proxies || data.proxies.length === 0) {
-                    body.innerHTML = '<tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无代理，请在上方添加。</td></tr>';
+                    body.innerHTML = '<tr><td colspan="7" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">暂无代理，请在上方添加。</td></tr>';
                     return;
                 }
                 body.innerHTML = data.proxies.map(p => {
                     const latency = (p.latency === null || p.latency === undefined) ? '-' : p.latency + ' ms';
                     const latClass = (p.latency !== null && p.latency !== undefined && p.latency < 500) ? 'text-emerald-600' : 'text-slate-600';
+                    const raw = p.addr_raw || p.addr;
+                    const fam = p.family === 'ipv6'
+                        ? '<span class="inline-block px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 text-[10px] font-medium font-mono">IPv6</span>'
+                        : '<span class="inline-block px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 text-[10px] font-medium font-mono">IPv4</span>';
                     return `<tr class="hover:bg-slate-50/60 transition-colors">
-                        <td class="px-5 py-2.5 font-mono text-slate-800 max-w-[340px] truncate" title="${escapeHtml(p.addr)}">${escapeHtml(p.addr)}</td>
+                        <td class="px-5 py-2.5 font-mono text-slate-800 max-w-[340px] truncate" title="${escapeHtml(raw)}">${escapeHtml(p.addr)}</td>
+                        <td class="px-5 py-2.5">${fam}</td>
                         <td class="px-5 py-2.5">${proxyStatusBadge(p.status)}${p.status === 'cooldown' && p.cooldown_remain ? `<span class="ml-1 text-[10px] text-amber-500">${p.cooldown_remain}s</span>` : ''}${p.quota_blocked ? `<div class="mt-1 text-[10px] text-orange-500 font-mono">${formatQuota(p.quota)}</div>` : ''}</td>
                         <td class="px-5 py-2.5 text-right font-mono ${latClass}">${latency}</td>
                         <td class="px-5 py-2.5 text-right text-slate-500 font-mono">${p.fail_count}</td>
                         <td class="px-5 py-2.5 text-slate-400 font-mono">${formatCooldown(p.cooldown_until)}</td>
                         <td class="px-5 py-2.5 text-right space-x-1.5">
-                            <button onclick="checkOneProxy('${escapeHtml(p.addr)}')" class="px-2 py-1 border border-slate-200 text-slate-600 rounded text-[11px] bg-white hover:bg-slate-50">Check</button>
-                            <button onclick="removeProxy('${escapeHtml(p.addr)}')" class="px-2 py-1 text-rose-600 rounded text-[11px] bg-transparent hover:bg-rose-50">删除</button>
+                            <button onclick="checkOneProxy('${escapeHtml(raw)}')" class="px-2 py-1 border border-slate-200 text-slate-600 rounded text-[11px] bg-white hover:bg-slate-50">Check</button>
+                            <button onclick="removeProxy('${escapeHtml(raw)}')" class="px-2 py-1 text-rose-600 rounded text-[11px] bg-transparent hover:bg-rose-50">删除</button>
                         </td>
                     </tr>`;
                 }).join('');
