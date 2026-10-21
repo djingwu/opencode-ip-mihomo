@@ -13,9 +13,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from proxy_utils import normalize_proxy_url
+from proxy_utils import normalize_proxy_url, with_v6_mark
 
 PROXY_LIST_FILE = Path(os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt"))
+PROXY_LIST_FILE_V6 = Path(os.environ.get("PROXY_LIST_FILE_V6", "/app/data/proxies-v6.txt"))
 PROXY_STATE_FILE = Path(os.environ.get("PROXY_STATE_FILE", "/app/data/proxy_state.json"))
 EGRESS_STATE_FILE = Path(os.environ.get("EGRESS_STATE_FILE", "/app/data/egress_state.json"))
 PROXY_COOLDOWN_BASE = int(os.environ.get("PROXY_COOLDOWN_BASE", "60"))
@@ -73,6 +74,16 @@ def read_proxy_list() -> List[str]:
         with PROXY_LIST_FILE.open("r", encoding="utf-8") as handle:
             values = [normalize_proxy_url(line) for line in handle if line.strip() and not line.lstrip().startswith("#")]
         result = list(dict.fromkeys(value for value in values if value))
+        # v6 池条目（data/proxies-v6.txt）：与 v4 同机、强制 IPv6 出口，
+        # 带 #v6 标记 → 与 v4 条目 URL 不同 → 池子扩容（灰度时先 1 台）。
+        if PROXY_LIST_FILE_V6.exists():
+            try:
+                with PROXY_LIST_FILE_V6.open("r", encoding="utf-8") as handle:
+                    v6_values = [with_v6_mark(normalize_proxy_url(line)) for line in handle
+                                 if line.strip() and not line.lstrip().startswith("#")]
+                result = list(dict.fromkeys(list(result) + [v for v in v6_values if v]))
+            except Exception:
+                pass
         _store_file_cache(PROXY_LIST_FILE, meta, result)
         return list(result)
     except Exception:

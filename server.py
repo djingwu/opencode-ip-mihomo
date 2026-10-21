@@ -26,9 +26,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
+import socket
+from urllib.parse import urlparse
+
 from curl_cffi import requests as cffi_requests
+from curl_cffi.const import CurlOpt, CurlIpResolve
 from rate_limits import EgressRatePolicy, classify_upstream_429
-from proxy_utils import normalize_proxy_url
+from proxy_utils import normalize_proxy_url, SOCKS_V6_MARK, with_v6_mark, strip_v6_mark
 import proxy_pool
 from rotator import flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
 import panel_manager as panel_mgr
@@ -84,8 +88,37 @@ async def _fetch_line_batch(loop, get_next_line, line_iter, limit: int):
     return await loop.run_in_executor(None, _drain_line_batch, get_next_line, line_iter, limit)
 
 
+def _v6_egress_rewrite(url: str, proxies):
+    """v6 池条目出站改写。返回 (url, proxies, curl_options)。
+
+    背景：自建 socks 出口机都带公网 IPv6（ATYP=4 CONNECT 探针 reply=0 实测，
+    10 台全支持），但 socks 对域名目标默认解析 v4；socks URL 又表达不了
+    "入口 v4 + 目标 v6"，且直接换 URL host 会破坏 TLS SNI/Host。故在此层：
+    ① 入口 URL 剥掉 #v6 标记，scheme socks5h → socks5（本地解析，解析出的
+       IPv6 字面量以 ATYP=4 交给 socks 服务端）；
+    ② curl_options IPRESOLVE=V6：URL 保持域名（SNI/Host 不变），仅传输层
+       强制 IPv6；
+    ③ 域名无 AAAA / 解析异常 → 原样返回，等价 v4 路径，兜底不断流。
+    """
+    if not proxies:
+        return url, proxies, None
+    pu = next((v for v in proxies.values() if v), None)
+    if not pu or SOCKS_V6_MARK not in pu:
+        return url, proxies, None
+    entry = strip_v6_mark(pu).replace("socks5h://", "socks5://", 1)
+    try:
+        host = urlparse(url).hostname
+        infos = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_STREAM) if host else []
+    except Exception:
+        infos = []
+    return url, {"http": entry, "https": entry}, (
+        {CurlOpt.IPRESOLVE: CurlIpResolve.V6} if infos else None)
+
+
 async def _post_upstream(session, url, *, json_body, headers, proxies, timeout):
     """同步 curl_cffi post 必须走线程池，否则阻塞事件循环拖住所有连接。"""
+    url, proxies, _v6_opts = _v6_egress_rewrite(url, proxies)
+    _extra = {"curl_options": _v6_opts} if _v6_opts else {}
     return await asyncio.to_thread(
         session.post,
         url,
@@ -95,10 +128,13 @@ async def _post_upstream(session, url, *, json_body, headers, proxies, timeout):
         stream=False,
         proxies=proxies,
         timeout=timeout,
+        **_extra,
     )
 
 
 async def _post_upstream_stream(session, url, *, json_body, headers, proxies, timeout):
+    url, proxies, _v6_opts = _v6_egress_rewrite(url, proxies)
+    _extra = {"curl_options": _v6_opts} if _v6_opts else {}
     return await asyncio.to_thread(
         session.post,
         url,
@@ -108,6 +144,7 @@ async def _post_upstream_stream(session, url, *, json_body, headers, proxies, ti
         stream=True,
         proxies=proxies,
         timeout=timeout,
+        **_extra,
     )
 
 # -----------------------------------------------------------------------------
@@ -129,6 +166,7 @@ class JSONFormatter(logging.Formatter):
 # Proxy Pool / Custom Proxy List Support
 # -----------------------------------------------------------------------------
 PROXY_FILE = Path(os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt"))
+PROXY_FILE_V6 = Path(os.environ.get("PROXY_LIST_FILE_V6", "/app/data/proxies-v6.txt"))
 _proxy_pool: List[str] = []
 _proxy_index = 0
 _proxy_lock = threading.Lock()
@@ -146,6 +184,18 @@ def load_proxy_list():
     env_proxies = os.environ.get("PROXY_LIST", "").strip()
     if env_proxies:
         proxies.extend([normalize_proxy_url(p) for p in env_proxies.split(",") if p.strip()])
+    # v6 池条目：与 v4 同机、强制 IPv6 出口（见 _v6_egress_rewrite）。
+    # 灰度方式：proxies-v6.txt 只放要试的机器（先 121 一台），池子只 +1 条。
+    if PROXY_FILE_V6.exists():
+        try:
+            with open(PROXY_FILE_V6, "r", encoding="utf-8") as f:
+                v6 = [with_v6_mark(normalize_proxy_url(p)) for p in
+                      (l.strip() for l in f if l.strip() and not l.startswith("#"))]
+                proxies.extend(v6)
+                if v6:
+                    log.info("Loaded %d IPv6 egress entries from %s", len(v6), PROXY_FILE_V6.name)
+        except Exception as e:
+            log.error(f"Error reading {PROXY_FILE_V6.name}: {e}")
     _proxy_pool = list(dict.fromkeys(proxies))
     if _proxy_pool:
         log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
