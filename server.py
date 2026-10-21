@@ -99,28 +99,45 @@ def _v6_egress_rewrite(url: str, proxies):
     ② curl_options IPRESOLVE=V6：URL 保持域名（SNI/Host 不变），仅传输层
        强制 IPv6；
     ③ 域名无 AAAA / 解析异常 → 原样返回，等价 v4 路径，兜底不断流。
+    返回 (url, proxies, use_v6)。
     """
     if not proxies:
-        return url, proxies, None
+        return url, proxies, False
     pu = next((v for v in proxies.values() if v), None)
     if not pu or SOCKS_V6_MARK not in pu:
-        return url, proxies, None
+        return url, proxies, False
     entry = strip_v6_mark(pu).replace("socks5h://", "socks5://", 1)
     try:
         host = urlparse(url).hostname
         infos = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_STREAM) if host else []
     except Exception:
         infos = []
-    return url, {"http": entry, "https": entry}, (
-        {CurlOpt.IPRESOLVE: CurlIpResolve.V6} if infos else None)
+    return url, {"http": entry, "https": entry}, bool(infos)
+
+
+_v6_session = None
+
+
+def _get_v6_session():
+    """v6 专用 curl session：固化 IPRESOLVE=V6。
+
+    curl_cffi 0.16.3 的 Session.request 不接受 request 级 curl_options
+    （只有模块级 request() 有），故用 Session.__init__ 的 curl_options
+    一次性固化。只被 v6 条目命中时惰性创建，v4 流量永远走原 session。
+    """
+    global _v6_session
+    if _v6_session is None:
+        _v6_session = cffi_requests.Session(
+            curl_options={int(CurlOpt.IPRESOLVE): int(CurlIpResolve.V6)})
+    return _v6_session
 
 
 async def _post_upstream(session, url, *, json_body, headers, proxies, timeout):
     """同步 curl_cffi post 必须走线程池，否则阻塞事件循环拖住所有连接。"""
-    url, proxies, _v6_opts = _v6_egress_rewrite(url, proxies)
-    _extra = {"curl_options": _v6_opts} if _v6_opts else {}
+    url, proxies, _use_v6 = _v6_egress_rewrite(url, proxies)
+    sess = _get_v6_session() if _use_v6 else session
     return await asyncio.to_thread(
-        session.post,
+        sess.post,
         url,
         json=json_body,
         headers=headers,
@@ -128,15 +145,14 @@ async def _post_upstream(session, url, *, json_body, headers, proxies, timeout):
         stream=False,
         proxies=proxies,
         timeout=timeout,
-        **_extra,
     )
 
 
 async def _post_upstream_stream(session, url, *, json_body, headers, proxies, timeout):
-    url, proxies, _v6_opts = _v6_egress_rewrite(url, proxies)
-    _extra = {"curl_options": _v6_opts} if _v6_opts else {}
+    url, proxies, _use_v6 = _v6_egress_rewrite(url, proxies)
+    sess = _get_v6_session() if _use_v6 else session
     return await asyncio.to_thread(
-        session.post,
+        sess.post,
         url,
         json=json_body,
         headers=headers,
@@ -144,7 +160,6 @@ async def _post_upstream_stream(session, url, *, json_body, headers, proxies, ti
         stream=True,
         proxies=proxies,
         timeout=timeout,
-        **_extra,
     )
 
 # -----------------------------------------------------------------------------

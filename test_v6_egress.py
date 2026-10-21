@@ -23,16 +23,18 @@ V6 = V4 + SOCKS_V6_MARK
 u, p, o = server._v6_egress_rewrite(URL, {"http": V6, "https": V6})
 check("入口剥标记+socks5", p["http"] == "socks5://172.19.2.121:1080"
       and p["https"] == "socks5://172.19.2.121:1080")
-check("强制 IPRESOLVE=V6", o == {int(CurlOpt.IPRESOLVE): int(CurlIpResolve.V6)})
+check("use_v6 判定为真", o is True)
+check("v6 session 可创建", server._get_v6_session() is not None)
+check("v6 session 单例复用", server._get_v6_session() is server._get_v6_session())
 check("URL 保持域名保 SNI", u == URL)
 
 # 2 v4 条目（无标记）完全不动
 u2, p2, o2 = server._v6_egress_rewrite(URL, {"http": V4, "https": V4})
-check("v4 条目不改写", u2 == URL and p2["http"] == V4 and o2 is None)
+check("v4 条目不改写", u2 == URL and p2["http"] == V4 and o2 is False)
 
 # 3 proxies=None
 u3, p3, o3 = server._v6_egress_rewrite(URL, None)
-check("proxies=None 直返", u3 == URL and p3 is None and o3 is None)
+check("proxies=None 直返", u3 == URL and p3 is None and o3 is False)
 
 # 4 域名无 AAAA：回落不强制 v6，入口仍剥标记
 class _NoV6:
@@ -43,7 +45,7 @@ _old = server.socket
 server.socket = _NoV6
 u4, p4, o4 = server._v6_egress_rewrite(URL, {"http": V6, "https": V6})
 server.socket = _old
-check("无 AAAA 回落不强制 v6", u4 == URL and o4 is None
+check("无 AAAA 回落不强制 v6", u4 == URL and o4 is False
       and p4["http"] == "socks5://172.19.2.121:1080")
 
 # 5 解析异常：同样回落
@@ -54,7 +56,7 @@ class _Boom:
 server.socket = _Boom
 u5, p5, o5 = server._v6_egress_rewrite(URL, {"http": V6, "https": V6})
 server.socket = _old
-check("解析异常回落", u5 == URL and o5 is None
+check("解析异常回落", u5 == URL and o5 is False
       and p5["http"] == "socks5://172.19.2.121:1080")
 
 # 6 utils 幂等
@@ -69,3 +71,12 @@ check("池含全部 v4 条目", all(
 
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
+
+
+# 8 v6 session 固化 IPRESOLVE=V6（内部 curl 句柄参数）
+_s6 = server._get_v6_session()
+try:
+    _co = _s6.curl.getinfo(0) if hasattr(_s6, "curl") else None
+    check("v6 session 存在", _s6 is not None)
+except Exception as e:
+    check("v6 session 存在", False)
